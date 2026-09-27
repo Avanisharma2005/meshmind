@@ -8,6 +8,8 @@ Thumbs.db
 
 # Dependencies
 node_modules/
+backend/.venv/
+backend/data/
 
 # Environment / secrets
 .env

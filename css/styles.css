@@ -357,6 +357,12 @@ button {
   font-family: var(--font-mono);
 }
 
+.memory-backend-status { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; color: var(--green); font-family: var(--font-mono); font-size: 12px; }
+.memory-incident { margin-top: 14px; }
+.memory-subtitle { margin-top: 10px; }
+.memory-incident ul { margin: 2px 0 0; padding-left: 18px; font-size: 12.5px; }
+.memory-unavailable { color: var(--text-dim); font-size: 12.5px; }
+
 .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
 .tag {
   font-family: var(--font-mono);

@@ -58,16 +58,6 @@ const MESH_DATA = {
       status: "operational", // operational | warning | critical
       operatingState: "Cutting — Active",
 
-      memory: {
-        incidentCount: 47,
-        recentIncident: {
-          title: "Bearing temperature spike",
-          outcome: "Resolved",
-          timeAgo: "3 days ago",
-        },
-        searchStatus: "Idle — index ready",
-      },
-
       peers: {
         nearby: ["Machine B", "Machine C"],
         contacted: false,

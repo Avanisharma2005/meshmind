@@ -1,0 +1,4 @@
+qdrant-edge-py==0.8.0
+fastembed
+fastapi
+uvicorn
