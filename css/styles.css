@@ -362,6 +362,7 @@ button {
 .memory-subtitle { margin-top: 10px; }
 .memory-incident ul { margin: 2px 0 0; padding-left: 18px; font-size: 12.5px; }
 .memory-unavailable { color: var(--text-dim); font-size: 12.5px; }
+.memory-empty { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-dim); font-size: 12.5px; }
 
 .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
 .tag {

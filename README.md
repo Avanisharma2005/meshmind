@@ -1,10 +1,10 @@
 # MeshMind
 
-## Machine A local semantic memory (Step 5)
+## Independent local semantic memory (Steps 5–6)
 
 MeshMind uses **Qdrant Edge** as an embedded local vector engine inside the Python backend process. Qdrant Edge is **not a Qdrant Server running on localhost**; localhost is used only for the small FastAPI interface that the browser calls.
 
-The backend stores one Machine A incident point (a dense vector and its payload) in `backend/data/qdrant_edge/`. It also caches the FastEmbed model under `backend/data/models/`. Both directories are local runtime data and are git-ignored.
+Machine A and Machine B use separate persistent Edge shard directories: Machine A is stored in `backend/data/qdrant_edge/`, and Machine B in `backend/data/qdrant_edge_machine_b/`. The Machine A shard contains its one bearing race wear incident. Machine B's shard is initialized empty and does not receive Machine A's incident. The FastEmbed model is cached under `backend/data/models/`. These are local runtime data and are git-ignored.
 
 The incident description is converted into a 384-dimensional embedding using FastEmbed's `sentence-transformers/all-MiniLM-L6-v2` model. The named `incident_text` vector uses cosine distance. For a semantic search, the submitted query is embedded with the same locally cached model and Qdrant Edge returns its nearest point and cosine similarity score. No embedding API or remote database is called at runtime.
 
@@ -41,7 +41,7 @@ cd backend
 .\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-At startup the backend loads the existing shard, or creates it with `EdgeShard.create()`, then inserts the deterministic incident point only if it is absent. Repeated restarts load the same persistent shard and do not create duplicate points. The exact count is read from Qdrant Edge.
+At startup the backend loads each existing shard, or creates it with `EdgeShard.create()`. It inserts Machine A's deterministic incident point only if it is absent; Machine B remains empty. Repeated restarts preserve the two separate stores and do not create duplicate points. The status endpoint returns the exact count for each machine.
 
 ### Start the frontend
 
@@ -53,21 +53,22 @@ python -m http.server 5500 --bind 127.0.0.1
 
 Open <http://127.0.0.1:5500>. Machine A's Local Memory panel reads its status, count, and incident payload from the local API. If the backend is stopped, that panel reports `Local memory backend unavailable`; other dashboard sections continue to work.
 
-### Verify one stored memory
+### Verify independent machine memories
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/memory/status
 Invoke-RestMethod http://127.0.0.1:8000/api/memory/machine/M-A-001
 ```
 
-The status response's `stored_memories` value is calculated using Qdrant Edge's exact point count rather than hard-coded in the frontend.
+The status response has a `machines` array with each `machine_id`, `memory_backend`, and exact `memory_count`. Machine A should report one memory and Machine B zero; the legacy top-level status fields still report Machine A for Step 5 callers.
 
 ### Test semantic search offline
 
 After installing dependencies and caching the model once, disconnect from the internet, start the backend and frontend, then send:
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -ContentType 'application/json' -Body '{"query":"motor is vibrating and getting hot"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -ContentType 'application/json' -Body '{"machine_id":"M-A-001","query":"motor is vibrating and getting hot"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -ContentType 'application/json' -Body '{"machine_id":"M-B-002","query":"motor is vibrating and getting hot"}'
 ```
 
-The response contains `matching_incident`, `similarity_score`, and the stored `payload`. The query is embedded locally and searched in the embedded Edge shard. No Qdrant Server, Qdrant Cloud, peer communication, or external AI service is involved.
+The Machine A response contains `matching_incident`, `similarity_score`, and the stored `payload`. Machine B returns null match fields while its shard is empty. Each query is embedded locally and sent only to the Edge shard for the requested `machine_id`. No Qdrant Server, Qdrant Cloud, peer communication, or external AI service is involved.

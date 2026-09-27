@@ -144,46 +144,41 @@ function renderSensors() {
 // ---- Render: local memory --------------------------------------------
 function renderMemory() {
   const el = document.getElementById("memory-panel");
-  const machine = getSelectedMachine();
-
-  if (machine.id !== "M-A-001") {
-    const { memory } = machine;
-    el.innerHTML = `
-      <div class="stat-row"><div class="stat-block"><div class="stat-num">${memory.incidentCount}</div><div class="stat-label">Stored incidents</div></div></div>
-      <div class="info-box"><div class="i-title">Most recent incident</div><div class="i-body">${memory.recentIncident.title}</div><div class="i-meta">${memory.recentIncident.outcome} · ${memory.recentIncident.timeAgo}</div></div>
-      <div style="margin-top:12px;"><span class="badge grey">${memory.searchStatus}</span></div>
-    `;
-    return;
-  }
-
-  const machineId = machine.id;
+  const machineId = getSelectedMachine().id;
   el.innerHTML = '<div class="badge grey">Loading local memory…</div>';
-  Promise.all([
-    fetch("http://127.0.0.1:8000/api/memory/status").then((response) => {
-      if (!response.ok) throw new Error("Memory status unavailable");
-      return response.json();
-    }),
-    fetch(`http://127.0.0.1:8000/api/memory/machine/${machineId}`).then((response) => {
-      if (!response.ok) throw new Error("Machine memory unavailable");
-      return response.json();
-    }),
-  ]).then(([status, payload]) => {
+  fetch("http://127.0.0.1:8000/api/memory/status").then((response) => {
+    if (!response.ok) throw new Error("Memory status unavailable");
+    return response.json();
+  }).then((status) => {
+    const machineMemory = status.machines.find((entry) => entry.machine_id === machineId);
+    if (!machineMemory) throw new Error("Machine memory status unavailable");
+    const payloadRequest = machineId === "M-A-001"
+      ? fetch(`http://127.0.0.1:8000/api/memory/machine/${machineId}`).then((response) => {
+        if (!response.ok) throw new Error("Machine memory unavailable");
+        return response.json();
+      })
+      : Promise.resolve(null);
+    return payloadRequest.then((payload) => ({ status, machineMemory, payload }));
+  }).then(({ status, machineMemory, payload }) => {
     if (getSelectedMachine().id !== machineId) return;
     el.innerHTML = `
       <div class="memory-backend-status"><span class="dot ${status.status === "online" ? "green" : "red"}"></span><strong>Local Memory: ${status.status.toUpperCase()}</strong></div>
-      <div class="detail-row"><span class="k">Memory Backend</span><span class="v">${status.backend}</span></div>
-      <div class="detail-row"><span class="k">Stored Memories</span><span class="v">${status.stored_memories}</span></div>
-      <div class="info-box memory-incident">
-        <div class="i-title">Historical Incident</div>
-        <div class="i-body">${payload.incident_type}</div>
-        <div class="i-title memory-subtitle">Symptoms</div>
-        <ul>${payload.symptoms.map((symptom) => `<li>${symptom}</li>`).join("")}</ul>
-        <div class="i-title memory-subtitle">Technician</div>
-        <ul>${payload.technician_action.split(";").map((action) => {
-          const trimmed = action.trim();
-          return `<li>${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}</li>`;
-        }).join("")}<li>Diagnosis ${payload.confirmed ? "confirmed" : "not confirmed"}</li></ul>
-      </div>
+      <div class="detail-row"><span class="k">Memory Owner</span><span class="v">${machineMemory.machine_id}</span></div>
+      <div class="detail-row"><span class="k">Memory Backend</span><span class="v">${machineMemory.memory_backend}</span></div>
+      <div class="detail-row"><span class="k">Stored Memories</span><span class="v">${machineMemory.memory_count}</span></div>
+      ${payload ? `
+        <div class="info-box memory-incident">
+          <div class="i-title">Historical Incident</div>
+          <div class="i-body">${payload.incident_type}</div>
+          <div class="i-title memory-subtitle">Symptoms</div>
+          <ul>${payload.symptoms.map((symptom) => `<li>${symptom}</li>`).join("")}</ul>
+          <div class="i-title memory-subtitle">Technician</div>
+          <ul>${payload.technician_action.split(";").map((action) => {
+            const trimmed = action.trim();
+            return `<li>${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}</li>`;
+          }).join("")}<li>Diagnosis ${payload.confirmed ? "confirmed" : "not confirmed"}</li></ul>
+        </div>
+      ` : `<div class="info-box memory-incident"><div class="i-title">Historical Incident</div><div class="memory-empty">No useful historical memory</div></div>`}
     `;
   }).catch(() => {
     if (getSelectedMachine().id !== machineId) return;

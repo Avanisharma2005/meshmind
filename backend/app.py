@@ -1,7 +1,7 @@
 """Local FastAPI interface for Machine A's Qdrant Edge memory."""
 
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +41,7 @@ app.add_middleware(
 
 
 class SearchRequest(BaseModel):
+    machine_id: Literal["M-A-001", "M-B-002"] = "M-A-001"
     query: str = Field(min_length=1, max_length=2000)
 
 
@@ -65,7 +66,15 @@ def machine_memory(machine_id: str) -> dict[str, Any]:
 
 @app.post("/api/memory/search")
 def search_memory(request: SearchRequest) -> dict[str, Any]:
-    result = get_memory().search(request.query)
+    result = get_memory().search(request.machine_id, request.query)
     if result is None:
+        if request.machine_id == "M-B-002":
+            return {
+                "machine_id": request.machine_id,
+                "matching_incident": None,
+                "similarity_score": None,
+                "payload": None,
+            }
         raise HTTPException(status_code=404, detail="No matching memory found")
+    result["machine_id"] = request.machine_id
     return result

@@ -1,4 +1,4 @@
-"""Machine A historical semantic memory backed by an embedded Qdrant Edge shard."""
+"""Independent local Qdrant Edge shards for Machines A and B."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ INCIDENT_PAYLOAD: dict[str, Any] = {
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BACKEND_DIR / "data"
 SHARD_PATH = DATA_DIR / "qdrant_edge"
+MACHINE_B_SHARD_PATH = DATA_DIR / "qdrant_edge_machine_b"
 MODEL_CACHE_PATH = DATA_DIR / "models"
 
 
@@ -60,17 +61,20 @@ class EdgeMemory:
             local_files_only=True,
         )
         self._lock = threading.RLock()
-        config = EdgeConfig(
-            vectors={
-                VECTOR_NAME: EdgeVectorParams(size=VECTOR_SIZE, distance=Distance.Cosine)
-            }
+        self._config = EdgeConfig(
+            vectors={VECTOR_NAME: EdgeVectorParams(size=VECTOR_SIZE, distance=Distance.Cosine)}
         )
-        SHARD_PATH.mkdir(parents=True, exist_ok=True)
-        if (SHARD_PATH / "edge_config.json").exists():
-            self._shard = EdgeShard.load(str(SHARD_PATH), config)
-        else:
-            self._shard = EdgeShard.create(str(SHARD_PATH), config)
+        self._shards = {
+            "M-A-001": self._open_shard(SHARD_PATH),
+            "M-B-002": self._open_shard(MACHINE_B_SHARD_PATH),
+        }
         self._seed_once()
+
+    def _open_shard(self, path: Path) -> EdgeShard:
+        path.mkdir(parents=True, exist_ok=True)
+        if (path / "edge_config.json").exists():
+            return EdgeShard.load(str(path), self._config)
+        return EdgeShard.create(str(path), self._config)
 
     def _embed(self, text: str) -> list[float]:
         vector = next(self._model.embed([text])).tolist()
@@ -82,11 +86,12 @@ class EdgeMemory:
 
     def _seed_once(self) -> None:
         with self._lock:
-            existing = self._shard.retrieve(
+            shard_a = self._shards[MACHINE_ID]
+            existing = shard_a.retrieve(
                 point_ids=[POINT_ID], with_payload=False, with_vector=False
             )
             if not existing:
-                self._shard.update(
+                shard_a.update(
                     UpdateOperation.upsert_points(
                         [
                             Point(
@@ -97,29 +102,43 @@ class EdgeMemory:
                         ]
                     )
                 )
-                self._shard.flush()
+                shard_a.flush()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            machines = [
+                {
+                    "machine_id": machine_id,
+                    "memory_backend": "Qdrant Edge",
+                    "memory_count": shard.count(CountRequest(exact=True)),
+                }
+                for machine_id, shard in self._shards.items()
+            ]
             return {
                 "status": "online",
                 "backend": "Qdrant Edge",
+                # Keep the Step 5 top-level fields for existing callers.
                 "machine_id": MACHINE_ID,
-                "stored_memories": self._shard.count(CountRequest(exact=True)),
+                "stored_memories": machines[0]["memory_count"],
+                "machines": machines,
             }
 
     def get_machine_memory(self, machine_id: str) -> dict[str, Any] | None:
-        if machine_id != MACHINE_ID:
+        shard = self._shards.get(machine_id)
+        if shard is None or machine_id != MACHINE_ID:
             return None
         with self._lock:
-            records = self._shard.retrieve(
+            records = shard.retrieve(
                 point_ids=[POINT_ID], with_payload=True, with_vector=False
             )
             return records[0].payload if records else None
 
-    def search(self, query_text: str) -> dict[str, Any] | None:
+    def search(self, machine_id: str, query_text: str) -> dict[str, Any] | None:
+        shard = self._shards.get(machine_id)
+        if shard is None:
+            return None
         with self._lock:
-            hits = self._shard.query(
+            hits = shard.query(
                 QueryRequest(
                     query=Query.Nearest(self._embed(query_text), using=VECTOR_NAME),
                     limit=1,
@@ -138,5 +157,6 @@ class EdgeMemory:
 
     def close(self) -> None:
         with self._lock:
-            self._shard.flush()
-            self._shard.close()
+            for shard in self._shards.values():
+                shard.flush()
+                shard.close()
