@@ -14,9 +14,11 @@ let selectedMachineId = MESH_DATA.machines[0].id;
 // Per-machine UI state that isn't "real" data yet, just interaction state
 // for this shell (technician verification decision, sync in-progress flag).
 const uiState = {};
+const localSearchState = {};
+let peerCommunicationState = null;
+let aiExplanationState = null;
 MESH_DATA.machines.forEach((m) => {
   uiState[m.id] = {
-    verificationStatus: m.verification.status, // not_required | pending | confirmed | rejected
     syncStatus: m.sync.status, // synced | pending | local_only | syncing
   };
 });
@@ -28,6 +30,78 @@ function getSelectedMachine() {
 function evaluateMachineAnomalies() {
   MESH_DATA.machines.forEach((machine) => {
     AnomalyDetector.evaluate(machine.id, SensorSimulator.getReadings(machine.id));
+  });
+}
+
+function describeSensorBehavior(key, reading, isTriggered) {
+  const labels = { vibration: "vibration", temperature: "temperature", current: "current", pressure: "pressure" };
+  if (!reading) return null;
+  if (isTriggered) {
+    const terms = {
+      vibration: "increased vibration",
+      temperature: "elevated temperature",
+      current: "abnormal current",
+      pressure: "abnormal pressure",
+    };
+    return terms[key] || `abnormal ${labels[key] || key}`;
+  }
+  return `normal ${labels[key] || key}`;
+}
+
+function buildLocalSearchQuery(machine, readings, anomaly) {
+  const triggered = new Set(anomaly.triggeredSensors.map((sensor) => sensor.sensorKey));
+  const behavior = [];
+  ["vibration", "temperature", "current", "pressure"].forEach((key) => {
+    const reading = readings[key];
+    if (!reading) return;
+    if (triggered.has(key)) behavior.push(`${describeSensorBehavior(key, reading, true)} (${reading.value.toFixed(1)} ${reading.unit})`);
+    else if (key === "current") behavior.push(`current draw ${reading.value.toFixed(1)} ${reading.unit} (within normal range)`);
+  });
+  const sensorText = behavior.length ? behavior.join(" and ") : "abnormal sensor behavior";
+  const anomalyType = anomaly.triggeredSensors.map((sensor) => `${sensor.sensor.toLowerCase()} anomaly`).join(" and ");
+  const operatingCondition = machine.operatingState || machine.operatingStatus || "current operating condition unknown";
+  return `${machine.type} experiencing ${sensorText} under ${operatingCondition} operating condition; ${anomalyType || "sensor anomaly"}.`;
+}
+
+function updateLocalSearch() {
+  const machine = MESH_DATA.machines.find((item) => item.id === "M-B-002");
+  const anomaly = AnomalyDetector.getState(machine.id);
+  if (!anomaly.detected) {
+    localSearchState[machine.id] = { query: "", status: "Waiting for a Machine B anomaly", result: null };
+    peerCommunicationState = null;
+    aiExplanationState = null;
+    return;
+  }
+  const query = buildLocalSearchQuery(machine, SensorSimulator.getReadings(machine.id), anomaly);
+  const current = localSearchState[machine.id];
+  if (current?.query === query && (current.status.startsWith("Searching") || current.result)) return;
+  peerCommunicationState = null;
+  localSearchState[machine.id] = { query, status: "Searching Machine B local memory", result: null };
+  if (getSelectedMachine().id === machine.id) renderLocalSearch();
+  fetch("http://127.0.0.1:8000/api/memory/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ machine_id: "M-B-002", query }),
+  }).then((response) => {
+    if (!response.ok) throw new Error("Local memory search unavailable");
+    return response.json();
+  }).then((result) => {
+    if (localSearchState[machine.id]?.query !== query) return;
+    localSearchState[machine.id] = {
+      query,
+      status: "Search complete",
+      result,
+    };
+    if (result.matching_incident) {
+      explainCurrentEvidence(query, result, null);
+    } else {
+      askMachineA(query);
+    }
+    if (getSelectedMachine().id === machine.id) renderLocalSearch();
+  }).catch(() => {
+    if (localSearchState[machine.id]?.query !== query) return;
+    localSearchState[machine.id] = { query, status: "Local memory backend unavailable", result: null, error: true };
+    if (getSelectedMachine().id === machine.id) renderLocalSearch();
   });
 }
 
@@ -186,108 +260,234 @@ function renderMemory() {
   });
 }
 
+function renderLocalSearch() {
+  const el = document.getElementById("local-search-panel");
+  const machine = getSelectedMachine();
+  const state = localSearchState["M-B-002"];
+  if (machine.id !== "M-B-002") {
+    el.innerHTML = '<div class="memory-empty">Local anomaly search is enabled for Machine B.</div>';
+    return;
+  }
+  if (!state || !state.query) {
+    el.innerHTML = `<div class="detail-row"><span class="k">Search status</span><span class="v">${state?.status || "Waiting for a Machine B anomaly"}</span></div>`;
+    return;
+  }
+  const result = state.result;
+  const payload = result?.payload;
+  el.innerHTML = `
+    <div class="detail-row"><span class="k">Search status</span><span class="v">${state.status}</span></div>
+    <div class="info-box local-search-query"><div class="i-title">Generated query</div><div class="i-body">${state.query}</div></div>
+    ${state.error ? '<div class="memory-unavailable">Local memory backend unavailable</div>' : ""}
+    ${result && !result.matching_incident ? '<div class="memory-empty local-search-empty">No useful local match found</div>' : ""}
+    ${result?.matching_incident ? `
+      <div class="info-box local-search-match">
+        <div class="i-title">Matching incident</div><div class="i-body">${result.matching_incident}</div>
+        <div class="detail-row local-search-score"><span class="k">Similarity score</span><span class="v">${Number(result.similarity_score).toFixed(4)}</span></div>
+        <div class="i-title memory-subtitle">Incident details</div>
+        <div class="i-body">${payload?.incident_text || payload?.diagnosis || "Incident details unavailable"}</div>
+      </div>
+    ` : ""}
+  `;
+}
+
 // ---- Render: peer knowledge --------------------------------------------
 function renderPeers() {
   const el = document.getElementById("peer-panel");
-  const { peers } = getSelectedMachine();
+  const state = getSelectedMachine().id === "M-B-002" ? peerCommunicationState : null;
+  if (!state) {
+    el.textContent = "No peer search performed yet.";
+    return;
+  }
+  const history = state.steps.map((step) => `<div class="detail-row"><span class="k">${step.machine}</span><span class="v">${step.state}</span></div>`).join("");
+  const knowledge = state.knowledge ? `
+    <div class="info-box local-search-match">
+      <div class="i-title">Knowledge received from Machine A (${state.knowledge.source_machine_id})</div>
+      <div class="detail-row"><span class="k">Incident type</span><span class="v">${state.knowledge.incident_type}</span></div>
+      <div class="detail-row"><span class="k">Symptoms</span><span class="v">${state.knowledge.symptoms.join(", ")}</span></div>
+      <div class="detail-row"><span class="k">Machine type</span><span class="v">${state.knowledge.machine_type}</span></div>
+      <div class="detail-row"><span class="k">Resolution</span><span class="v">${state.knowledge.resolution}</span></div>
+      <div class="detail-row"><span class="k">Technician confirmation</span><span class="v">${state.knowledge.technician_confirmed ? "Confirmed" : "Not confirmed"}</span></div>
+      <div class="detail-row"><span class="k">Similarity score</span><span class="v">${Number(state.knowledge.similarity_score).toFixed(4)}</span></div>
+    </div>
+  ` : "";
+  el.innerHTML = `${history}${state.error ? `<div class="memory-unavailable">${state.error}</div>` : ""}${knowledge}`;
+}
 
+function askMachineA(query) {
+  if (peerCommunicationState?.query === query) return;
+  peerCommunicationState = {
+    query,
+    steps: [
+      { machine: "Machine B", state: "ASKING NEARBY MACHINE" },
+      { machine: "Machine A", state: "SEARCHING LOCAL MEMORY" },
+    ],
+    knowledge: null,
+    error: null,
+  };
+  if (getSelectedMachine().id === "M-B-002") renderPeers();
+  fetch("http://127.0.0.1:8000/api/machine-a/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requesting_machine_id: "M-B-002", query }),
+  }).then((response) => {
+    if (!response.ok) throw new Error("Machine A knowledge service unavailable");
+    return response.json();
+  }).then((knowledge) => {
+    if (peerCommunicationState?.query !== query) return;
+    peerCommunicationState.steps = [
+      { machine: "Machine B", state: "ASKING NEARBY MACHINE" },
+      { machine: "Machine A", state: "SEARCHING LOCAL MEMORY" },
+      { machine: "Machine A", state: knowledge.found ? "KNOWLEDGE FOUND" : "NO USEFUL MATCH FOUND" },
+      { machine: "Machine A", state: "RESPONSE SENT" },
+      { machine: "Machine B", state: "KNOWLEDGE RECEIVED" },
+    ];
+    peerCommunicationState.knowledge = knowledge.found ? knowledge : null;
+    peerCommunicationState.error = knowledge.found ? null : "Machine A found no useful local match.";
+    explainCurrentEvidence(query, localSearchState["M-B-002"]?.result, knowledge.found ? knowledge : null);
+    if (getSelectedMachine().id === "M-B-002") renderPeers();
+  }).catch((error) => {
+    if (peerCommunicationState?.query !== query) return;
+    peerCommunicationState.steps = [
+      { machine: "Machine B", state: "ASKING NEARBY MACHINE" },
+      { machine: "Machine A", state: "SEARCHING LOCAL MEMORY" },
+    ];
+    peerCommunicationState.error = error.message;
+    explainCurrentEvidence(query, localSearchState["M-B-002"]?.result, null);
+    if (getSelectedMachine().id === "M-B-002") renderPeers();
+  });
+}
+
+// ---- Render: AI recommendation ------------------------------------------
+function escapeHTML(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[character]);
+}
+
+function renderAI() {
+  const el = document.getElementById("ai-panel");
+  const machine = getSelectedMachine();
+  const anomaly = AnomalyDetector.getState("M-B-002");
+  const state = machine.id === "M-B-002" ? aiExplanationState : null;
+  if (!anomaly.detected || !state) {
+    el.textContent = "No AI diagnosis performed yet.";
+    return;
+  }
+  if (state.status !== "complete") {
+    el.innerHTML = `<div class="memory-unavailable">${escapeHTML(state.error || state.status)}</div>`;
+    return;
+  }
+
+  const { result, evidence } = state;
+  const sensors = evidence.machine_b;
+  const local = evidence.machine_b_local_search;
+  const peer = evidence.machine_a_peer_knowledge;
   el.innerHTML = `
-    <div class="i-title" style="margin-bottom:8px;">Nearby machines</div>
-    <div class="tag-list">
-      ${peers.nearby.map((p) => `<span class="tag">${p}</span>`).join("")}
+    <div class="ai-head">
+      <div>
+        <div class="ai-sub">Possible diagnosis</div>
+        <div class="ai-diagnosis">${escapeHTML(result.possible_diagnosis)}</div>
+        <div class="ai-sub">Generated from the supplied machine and memory evidence; historical similarity is not proof.</div>
+      </div>
+      <div class="confidence-block">
+        <div class="confidence-value">${result.confidence}%</div>
+        <div class="confidence-label">Evidence confidence</div>
+        <div class="confidence-bar"><div class="confidence-bar-fill" style="width:${result.confidence}%"></div></div>
+      </div>
     </div>
-    <div style="margin: 12px 0;">
-      <span class="badge ${peers.contacted ? "cyan" : "grey"}">
-        ${peers.contacted ? `Contacted — ${peers.contactedPeer}` : "No peer contacted"}
-      </span>
+    <div class="info-box ai-source-box">
+      <div class="i-title">Evidence sources used</div>
+      <ul class="ai-source-list">
+        <li><strong>Machine B current anomaly:</strong> ${escapeHTML(sensors.machine_id)} ${escapeHTML(sensors.machine_type)}, ${escapeHTML(sensors.anomaly_state)}; temperature ${sensors.current_temperature} °C, vibration ${sensors.current_vibration} mm/s, current ${sensors.current_current} A, pressure ${sensors.current_pressure} bar. Triggered: ${escapeHTML(sensors.triggered_sensors.join(", ") || "none")}.</li>
+        <li><strong>Machine B local memory:</strong> ${local.useful_match_found ? `${escapeHTML(local.matching_incident)} (similarity ${Number(local.similarity_score).toFixed(4)})` : "No useful local match found."}</li>
+        <li><strong>Machine A retrieved knowledge:</strong> ${peer ? `${escapeHTML(peer.incident_type)} from ${escapeHTML(peer.machine_type)} on ${escapeHTML(peer.source_machine_id)} (similarity ${Number(peer.similarity_score).toFixed(4)})` : "No Machine A incident was supplied."}</li>
+      </ul>
+      <div class="i-meta">Anomaly query: ${escapeHTML(sensors.anomaly_query_description)}</div>
     </div>
-    <div class="info-box">
-      <div class="i-title">Retrieved knowledge</div>
-      <div class="i-body">${peers.retrieval}</div>
+    <div class="i-title ai-section-title">Evidence</div>
+    <ul class="evidence-list">${result.evidence.map((fact) => `<li>${escapeHTML(fact)}</li>`).join("")}</ul>
+    <div class="action-box">
+      <div class="a-label">Recommendation</div>
+      <div>${escapeHTML(result.recommendation)}</div>
     </div>
   `;
 }
 
-// ---- Render: AI recommendation ------------------------------------------
-function renderAI() {
-  const el = document.getElementById("ai-panel");
-  const { ai } = getSelectedMachine();
+function explanationEvidenceFingerprint(evidence) {
+  const sensor = evidence.machine_b;
+  const local = evidence.machine_b_local_search;
+  const peer = evidence.machine_a_peer_knowledge;
+  const roundedScore = (score) => score == null ? null : Math.round(Number(score) * 10) / 10;
+  return JSON.stringify({
+    machine_id: sensor.machine_id,
+    machine_type: sensor.machine_type,
+    anomaly_state: sensor.anomaly_state,
+    triggered_sensors: [...sensor.triggered_sensors].sort(),
+    triggered_values: Object.fromEntries(sensor.triggered_sensors.map((key) => [key, sensor[`current_${key}`]])),
+    local_match: [local.useful_match_found, local.matching_incident, roundedScore(local.similarity_score)],
+    peer: peer && [peer.source_machine_id, peer.incident_type, peer.symptoms, peer.machine_type, peer.resolution, peer.technician_confirmed, roundedScore(peer.similarity_score)],
+  });
+}
 
-  el.innerHTML = `
-    <div class="ai-head">
-      <div>
-        <div class="ai-diagnosis">${ai.diagnosis}</div>
-        <div class="ai-sub">Based on local memory + peer knowledge</div>
-      </div>
-      <div class="confidence-block">
-        <div class="confidence-value">${ai.confidence}%</div>
-        <div class="confidence-label">Confidence</div>
-        <div class="confidence-bar"><div class="confidence-bar-fill" style="width:${ai.confidence}%"></div></div>
-      </div>
-    </div>
-    <ul class="evidence-list">
-      ${ai.evidence.map((e) => `<li>${e}</li>`).join("")}
-    </ul>
-    <div class="action-box">
-      <div class="a-label">Recommended action</div>
-      <div>${ai.action}</div>
-    </div>
-  `;
+function explainCurrentEvidence(query, localResult, peerKnowledge) {
+  const machine = MESH_DATA.machines.find((item) => item.id === "M-B-002");
+  const anomaly = AnomalyDetector.getState(machine.id);
+  if (!anomaly.detected || !localResult) return;
+  const readings = SensorSimulator.getReadings(machine.id);
+  const evidence = {
+    machine_b: {
+      machine_id: machine.id,
+      machine_type: machine.type,
+      current_temperature: readings.temperature.value,
+      current_vibration: readings.vibration.value,
+      current_current: readings.current.value,
+      current_pressure: readings.pressure.value,
+      anomaly_state: anomaly.state,
+      triggered_sensors: anomaly.triggeredSensors.map((item) => item.sensorKey),
+      anomaly_query_description: query,
+    },
+    machine_b_local_search: {
+      useful_match_found: Boolean(localResult.matching_incident),
+      matching_incident: localResult.matching_incident || null,
+      similarity_score: localResult.similarity_score ?? null,
+    },
+    machine_a_peer_knowledge: peerKnowledge ? {
+      source_machine_id: peerKnowledge.source_machine_id,
+      incident_type: peerKnowledge.incident_type,
+      symptoms: peerKnowledge.symptoms,
+      machine_type: peerKnowledge.machine_type,
+      resolution: peerKnowledge.resolution,
+      technician_confirmed: peerKnowledge.technician_confirmed,
+      similarity_score: peerKnowledge.similarity_score,
+    } : null,
+  };
+  const fingerprint = explanationEvidenceFingerprint(evidence);
+  if (aiExplanationState?.fingerprint === fingerprint) return;
+  aiExplanationState = { fingerprint, status: "Generating evidence-based explanation…", evidence, result: null, error: null };
+  if (getSelectedMachine().id === machine.id) renderAI();
+  fetch("http://127.0.0.1:8000/api/ai/explain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(evidence),
+  }).then(async (response) => {
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || "AI explanation unavailable");
+    return body;
+  }).then((result) => {
+    if (aiExplanationState?.fingerprint !== fingerprint) return;
+    aiExplanationState = { fingerprint, status: "complete", evidence, result, error: null };
+    if (getSelectedMachine().id === machine.id) renderAI();
+  }).catch((error) => {
+    if (aiExplanationState?.fingerprint !== fingerprint) return;
+    aiExplanationState = { fingerprint, status: "error", evidence, result: null, error: error.message };
+    if (getSelectedMachine().id === machine.id) renderAI();
+  });
 }
 
 // ---- Render: technician verification ------------------------------------
 function renderVerification() {
-  const el = document.getElementById("verification-panel");
-  const m = getSelectedMachine();
-  const state = uiState[m.id];
-
-  if (state.verificationStatus === "not_required") {
-    el.innerHTML = `
-      <div class="verify-row">
-        <div class="verify-summary">No anomaly flagged — nothing for a technician to verify right now.</div>
-      </div>
-    `;
-    return;
-  }
-
-  const resultText = {
-    pending: "Awaiting technician review.",
-    confirmed: "Confirmed by technician — ready to sync as validated knowledge.",
-    rejected: "Rejected by technician — will not be synced to Qdrant Cloud.",
-  }[state.verificationStatus];
-
-  el.innerHTML = `
-    <div class="verify-row">
-      <div class="verify-summary">
-        AI recommends: <strong>${m.ai.action}</strong>
-      </div>
-      <div class="btn-group">
-        <button class="btn btn-confirm" id="btn-confirm" ${state.verificationStatus !== "pending" ? "disabled" : ""}>Confirm</button>
-        <button class="btn btn-reject" id="btn-reject" ${state.verificationStatus !== "pending" ? "disabled" : ""}>Reject</button>
-      </div>
-    </div>
-    <div class="verify-result">${resultText}</div>
-  `;
-
-  const confirmBtn = document.getElementById("btn-confirm");
-  const rejectBtn = document.getElementById("btn-reject");
-
-  if (confirmBtn) {
-    confirmBtn.addEventListener("click", () => {
-      uiState[m.id].verificationStatus = "confirmed";
-      uiState[m.id].syncStatus = "pending";
-      renderVerification();
-      renderSync();
-    });
-  }
-  if (rejectBtn) {
-    rejectBtn.addEventListener("click", () => {
-      uiState[m.id].verificationStatus = "rejected";
-      uiState[m.id].syncStatus = "local_only";
-      renderVerification();
-      renderSync();
-    });
-  }
+  document.getElementById("verification-panel").textContent =
+    "No AI recommendation available for technician verification yet.";
 }
 
 // ---- Render: synchronization ---------------------------------------------
@@ -343,6 +543,8 @@ function renderAll() {
   renderMachineDetail();
   renderSensors();
   renderMemory();
+  updateLocalSearch();
+  renderLocalSearch();
   renderPeers();
   renderAI();
   renderVerification();
@@ -354,8 +556,12 @@ document.addEventListener("DOMContentLoaded", () => {
   renderAll();
   SensorSimulator.start(() => {
     evaluateMachineAnomalies();
+    updateLocalSearch();
+    renderLocalSearch();
     renderMachineList();
     renderMachineDetail();
     renderSensors();
+    renderPeers();
+    renderAI();
   });
 });

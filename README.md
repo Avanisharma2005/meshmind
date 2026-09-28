@@ -71,4 +71,19 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -Con
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -ContentType 'application/json' -Body '{"machine_id":"M-B-002","query":"motor is vibrating and getting hot"}'
 ```
 
-The Machine A response contains `matching_incident`, `similarity_score`, and the stored `payload`. Machine B returns null match fields while its shard is empty. Each query is embedded locally and sent only to the Edge shard for the requested `machine_id`. No Qdrant Server, Qdrant Cloud, peer communication, or external AI service is involved.
+The Machine A response contains `matching_incident`, `similarity_score`, and the stored `payload`. Machine B returns null match fields while its shard is empty. Each query is embedded locally and sent only to the Edge shard for the requested `machine_id`. Semantic search does not call an external embedding API or database.
+
+## Evidence-based AI explanation (Step 9)
+
+After Machine B detects an anomaly and finishes its own local search (and Machine A peer search when needed), FastAPI sends the structured sensor, anomaly, local-search, and peer-incident evidence to the OpenAI Responses API. The backend defaults to `gpt-6-astra` and uses Structured Outputs to require a validated JSON response. It constrains possible diagnoses to incident names in the supplied search evidence or `Insufficient evidence`, and limits evidence bullets to facts constructed from that request. The historical Machine A incident is supporting evidence, not proof. AI explanations are not generated on every simulator tick; the frontend deduplicates requests using the anomaly and material search/peer evidence.
+
+Set the API key in the same PowerShell session used to start the backend. The key stays in the backend environment and is never sent to browser JavaScript:
+
+```powershell
+$env:OPENAI_API_KEY = "your-api-key"
+$env:OPENAI_MODEL = "gpt-6-astra" # optional; defaults to gpt-6-astra
+cd backend
+.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+The `.env` patterns are already excluded by `.gitignore`; do not commit API keys. The `/api/ai/explain` endpoint returns HTTP 503 with a setup message when `OPENAI_API_KEY` is absent. No additional Python dependency is required for this API call.
