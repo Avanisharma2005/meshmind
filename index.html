@@ -57,6 +57,49 @@
     <!-- ---- CONTENT COLUMN ---- -->
     <div class="content">
 
+      <!-- DETERMINISTIC HACKATHON DEMO CONTROLS -->
+      <section class="panel demo-controls-panel" aria-labelledby="demo-controls-title">
+        <div class="demo-controls-heading">
+          <div>
+            <div class="eyebrow">LIVE SYSTEM ACTIONS</div>
+            <h2 id="demo-controls-title">DEMO CONTROLS</h2>
+            <p>Each control runs the existing simulator or backend flow. Results and service errors appear below.</p>
+          </div>
+          <button class="btn demo-reset" type="button" data-demo-action="reset">Reset Demo</button>
+        </div>
+        <div class="demo-control-groups">
+          <div class="demo-control-group"><h3>Selected machine · normal sensor state &amp; local Edge search</h3>
+            <button class="btn btn-primary" type="button" data-demo-action="normal">Normal Machine</button>
+            <button class="btn" type="button" data-demo-action="search">Search Local Memory</button>
+          </div>
+          <div class="demo-control-group"><h3>Machine B · anomaly detection</h3>
+            <button class="btn btn-primary" type="button" data-demo-action="anomaly">Trigger Anomaly</button>
+          </div>
+          <div class="demo-control-group"><h3>Peer knowledge · Machine A → B</h3>
+            <button class="btn" type="button" data-demo-action="peer">Ask Nearby Machine</button>
+          </div>
+          <div class="demo-control-group"><h3>Technician verification · Machine B</h3>
+            <button class="btn btn-confirm" type="button" data-demo-action="confirm">Technician Confirm</button>
+            <button class="btn btn-reject" type="button" data-demo-action="reject">Technician Reject</button>
+          </div>
+          <div class="demo-control-group"><h3>Cloud &amp; Gateway</h3>
+            <button class="btn" type="button" data-demo-action="cloud-off">Cloud OFF</button>
+            <button class="btn" type="button" data-demo-action="cloud-on">Cloud ON</button>
+            <button class="btn btn-primary" type="button" data-demo-action="sync">Sync Now</button>
+          </div>
+          <div class="demo-control-group"><h3>Machine C · Cloud → local Edge</h3>
+            <button class="btn btn-primary" type="button" data-demo-action="machine-c">Add Machine C</button>
+          </div>
+        </div>
+        <div id="demo-control-feedback" class="demo-control-feedback" role="status" aria-live="polite">Ready. Choose an action to run its real system flow.</div>
+      </section>
+
+      <details class="panel how-it-works">
+        <summary>
+          <span class="how-it-works-title">How MeshMind Works</span>
+          <span class="how-it-works-note">Architecture and incident lifecycle</span>
+        </summary>
+        <div class="how-it-works-content">
       <!-- SYSTEM ARCHITECTURE OVERVIEW -->
       <section class="panel architecture-panel" aria-labelledby="architecture-title">
         <div class="visual-heading">
@@ -122,6 +165,8 @@
         </ol>
         <div class="flow-footnote"><span class="flow-local-key">LOCAL EDGE</span><span class="flow-gateway-key">GATEWAY</span><span class="flow-cloud-key">QDRANT CLOUD</span><span class="flow-policy">Only Gateway-approved items synchronize.</span></div>
       </section>
+        </div>
+      </details>
 
       <!-- SENSOR MONITORING -->
       <section class="panel">

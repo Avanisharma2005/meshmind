@@ -20,6 +20,7 @@ from memory.edge_memory import EdgeMemory
 
 memory: EdgeMemory | None = None
 SYNC_QUEUE_PATH = Path(__file__).resolve().parent / "data" / "sync_queue.jsonl"
+TECHNICIAN_AUDIT_PATH = Path(__file__).resolve().parent / "data" / "technician_verification.jsonl"
 sync_queue_lock = threading.RLock()
 gateway_sync_lock = threading.Lock()
 cloud_sync_paused = False
@@ -60,6 +61,7 @@ app.add_middleware(
 class SearchRequest(BaseModel):
     machine_id: Literal["M-A-001", "M-B-002", "M-C-003"] = "M-A-001"
     query: str = Field(min_length=1, max_length=2000)
+    demo_mode: bool = False
 
 
 class MachineAAskRequest(BaseModel):
@@ -69,6 +71,8 @@ class MachineAAskRequest(BaseModel):
 
 class MachineBSensorEvidence(BaseModel):
     machine_id: Literal["M-B-002"]
+    incident_id: str = Field(default="", max_length=200)
+    demo_mode: bool = False
     machine_type: str = Field(min_length=1, max_length=100)
     current_temperature: float = Field(ge=-50, le=300)
     current_vibration: float = Field(ge=0, le=100)
@@ -328,6 +332,14 @@ def enqueue_validated_memory(memory_result: dict[str, Any]) -> dict[str, Any]:
         existing_entries = read_sync_queue()
         for entry in existing_entries:
             if entry.get("queue_entry_id") == entry_id:
+                if str(entry.get("sync_status", "")).casefold() != "canceled":
+                    return entry
+                entry.update({
+                    "sync_status": "Pending Sync", "processing_status": "Pending Sync",
+                    "queue_state": "created", "last_sync_error": None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                write_sync_queue(existing_entries)
                 return entry
 
         now = datetime.now(timezone.utc).isoformat()
@@ -339,6 +351,8 @@ def enqueue_validated_memory(memory_result: dict[str, Any]) -> dict[str, Any]:
             "updated_at": now,
             "source": "technician_validation",
             "local_memory_reference_id": memory_reference,
+            "memory_scope": memory_result.get("memory_scope", "machine"),
+            "incident_id": memory_result.get("incident_id"),
             "technician_confirmed": bool(memory_result.get("technician_confirmed")),
             "knowledge_type": (
                 "unclassified"
@@ -439,6 +453,25 @@ def sync_queue_status() -> dict[str, Any]:
         "pending_sync_count": pending_count,
         "synchronization_enabled": qdrant_cloud_config() is not None,
     }
+
+
+@app.post("/api/demo/reset")
+def reset_isolated_demo_memories() -> dict[str, Any]:
+    """Clear isolated demo Edge shards only and retain queue history and normal memories."""
+    counts = get_memory().reset_demo_memories()
+    with sync_queue_lock:
+        entries = read_sync_queue()
+        canceled = 0
+        for entry in entries:
+            if entry.get("memory_scope") == "demo" and str(entry.get("sync_status", "")).casefold() in {"pending sync", "failed", "processing"}:
+                entry.update({
+                    "sync_status": "Canceled", "processing_status": "Canceled by demo reset",
+                    "last_sync_error": None, "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                canceled += 1
+        if canceled:
+            write_sync_queue(entries)
+    return {"status": "reset", "deleted_demo_memories": counts, "canceled_pending_demo_entries": canceled}
 
 
 @app.get("/api/gateway/pending")
@@ -571,7 +604,7 @@ def _validated_cloud_payload(
     reference_id = str(item.get("local_memory_reference_id", ""))
     record_payload = {
         "machine_id": machine_id,
-        "incident_id": item.get("queue_entry_id"),
+        "incident_id": payload.get("incident_id", item.get("incident_id", item.get("queue_entry_id"))),
         "incident_type": incident_type,
         "symptoms": payload.get("symptoms", []),
         "machine_type": payload.get("machine_type", "Unknown machine"),
@@ -650,7 +683,7 @@ def gateway_sync() -> dict[str, Any]:
                 reference_id = str(item.get("local_memory_reference_id", ""))
                 if not reference_id:
                     raise ValueError("Local memory reference is missing")
-                record = get_memory().get_memory_record(machine_id, reference_id)
+                record = get_memory().get_memory_record(machine_id, reference_id, demo_mode=item.get("memory_scope") == "demo")
                 if record is None:
                     raise ValueError("Referenced validated local memory was not found")
                 record_payload, vector = _validated_cloud_payload(item, record, gateway_decision)
@@ -727,6 +760,8 @@ def gateway_sync() -> dict[str, Any]:
 
 @app.get("/api/gateway/global-memory")
 def gateway_global_memory() -> dict[str, Any]:
+    if cloud_sync_paused:
+        return {"cloud_status": "offline", "items": [], "message": "Cloud communication is disabled locally"}
     if qdrant_cloud_config() is None:
         return {"cloud_status": "not_configured", "items": [], "message": "Cloud not configured"}
     try:
@@ -784,7 +819,7 @@ def _approved_machine_c_knowledge(payload: Any) -> bool:
 
 
 @app.post("/api/machine-c/retrieve-global")
-def retrieve_global_knowledge_for_machine_c() -> dict[str, Any]:
+def retrieve_global_knowledge_for_machine_c(demo_mode: bool = False) -> dict[str, Any]:
     """Read approved knowledge from Cloud and import relevant records to C's Edge shard."""
     if cloud_sync_paused:
         return {
@@ -831,6 +866,8 @@ def retrieve_global_knowledge_for_machine_c() -> dict[str, Any]:
             machine["memory_count"] for machine in local_memory.status()["machines"]
             if machine["machine_id"] == "M-C-003"
         )
+        if demo_mode:
+            before_count = local_memory.demo_memory_count("M-C-003")
         imports: list[dict[str, Any]] = []
         retrieved: list[dict[str, Any]] = []
         for point in matching:
@@ -854,7 +891,7 @@ def retrieve_global_knowledge_for_machine_c() -> dict[str, Any]:
                 "gateway_decision": payload.get("gateway_decision"),
                 "payload": payload,
             }
-            imported = local_memory.import_cloud_knowledge(cloud_id, payload, raw_vector)
+            imported = local_memory.import_cloud_knowledge(cloud_id, payload, raw_vector, demo_mode=demo_mode)
             retrieved.append(knowledge)
             imports.append({key: value for key, value in imported.items() if key != "payload"})
 
@@ -862,6 +899,8 @@ def retrieve_global_knowledge_for_machine_c() -> dict[str, Any]:
             machine["memory_count"] for machine in local_memory.status()["machines"]
             if machine["machine_id"] == "M-C-003"
         )
+        if demo_mode:
+            after_count = local_memory.demo_memory_count("M-C-003")
         primary = retrieved[0] if retrieved else None
         query = None
         local_search = None
@@ -869,7 +908,7 @@ def retrieve_global_knowledge_for_machine_c() -> dict[str, Any]:
             symptoms = primary.get("symptoms") or []
             symptom_text = ", ".join(str(value) for value in symptoms) if isinstance(symptoms, list) else str(symptoms)
             query = f"{primary.get('machine_type', 'Conveyor Motor')} {primary.get('incident_type', 'bearing wear')}; symptoms: {symptom_text}"
-            local_search = local_memory.search("M-C-003", query)
+            local_search = local_memory.search("M-C-003", query, demo_mode=demo_mode)
         return {
             "cloud_status": "online",
             "cloud_knowledge_retrieved": retrieved,
@@ -897,7 +936,7 @@ def machine_memory(machine_id: str) -> dict[str, Any]:
 
 @app.post("/api/memory/search")
 def search_memory(request: SearchRequest) -> dict[str, Any]:
-    result = get_memory().search(request.machine_id, request.query)
+    result = get_memory().search(request.machine_id, request.query, demo_mode=request.demo_mode)
     if result is None:
         if request.machine_id in {"M-B-002", "M-C-003"}:
             return {
@@ -914,6 +953,12 @@ def search_memory(request: SearchRequest) -> dict[str, Any]:
 @app.post("/api/machine-b/technician-verification")
 def verify_machine_b_diagnosis(request: TechnicianVerificationRequest) -> dict[str, Any]:
     """Record a technician decision; only confirmed/corrected diagnoses become memories."""
+    if request.decision in {"confirmed", "corrected"} and request.diagnosis.strip().casefold() in {
+        "insufficient evidence", "unknown", "undetermined", "inconclusive", "none",
+    }:
+        raise HTTPException(status_code=422, detail="A concrete technician diagnosis is required")
+    if request.decision in {"confirmed", "corrected"} and request.evidence.machine_b.demo_mode and not request.evidence.machine_b.incident_id.strip():
+        raise HTTPException(status_code=422, detail="A stable demo incident identity is required")
     record: dict[str, Any] = {
         "machine_id": request.machine_id,
         "decision": request.decision,
@@ -931,6 +976,8 @@ def verify_machine_b_diagnosis(request: TechnicianVerificationRequest) -> dict[s
                 evidence=request.evidence.model_dump(),
                 original_recommendation=request.original_recommendation,
                 corrected=request.decision == "corrected",
+                demo_mode=request.evidence.machine_b.demo_mode,
+                incident_id=request.evidence.machine_b.incident_id,
             )
         except Exception as exc:
             raise HTTPException(status_code=500, detail="Could not create validated Machine B memory") from exc
@@ -942,7 +989,7 @@ def verify_machine_b_diagnosis(request: TechnicianVerificationRequest) -> dict[s
         record["sync_queue_entry_id"] = queue_entry["queue_entry_id"]
         result = {"status": "validated", **memory_result, "sync_queue_entry": queue_entry}
 
-    audit_path = Path(__file__).resolve().parent / "data" / "technician_verification.jsonl"
+    audit_path = TECHNICIAN_AUDIT_PATH
     try:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         with audit_path.open("a", encoding="utf-8") as audit_file:
@@ -1186,7 +1233,11 @@ def _local_rules_fallback(
             f"Peer semantic similarity score: {peer.similarity_score} (threshold 0.50; {'matched' if score_match else 'not matched'}).",
             score_match,
         ))
+        bearing_evidence = "bearing" in " ".join([peer.incident_type, peer.resolution, *peer.symptoms]).casefold()
         recommendation = (
+            f"Have a qualified technician inspect the bearing, using Machine A's historical resolution as guidance: {peer.resolution}. "
+            "This history supports investigation but does not prove the same failure on Machine B."
+            if bearing_evidence else
             f"Use Machine A's historical resolution as guidance: {peer.resolution}. "
             "This history supports investigation but does not prove the same failure on Machine B."
         )

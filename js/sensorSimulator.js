@@ -5,6 +5,7 @@
  */
 const SensorSimulator = (() => {
   const UPDATE_INTERVAL_MS = 2000;
+  const DEMO_INCIDENT_ID = "meshmind-demo:M-B-002:bearing-anomaly:v1";
   const profiles = {
     "M-A-001": {
       temperature: { value: 66.2, min: 55, max: 78, step: 0.7, unit: "°C", range: "Simulated range: 55–78 °C" },
@@ -39,6 +40,22 @@ const SensorSimulator = (() => {
     return readingsByMachine[machineId];
   }
 
+  function restoreNormal(machineId) {
+    const profile = profiles[machineId];
+    const sensors = readingsByMachine[machineId];
+    if (!profile || !sensors) return false;
+    delete demoAnomalyUntil[machineId];
+    delete demoRestoreValues[machineId];
+    Object.entries(profile).forEach(([key, sensor]) => {
+      sensors[key].value = sensor.value;
+    });
+    return true;
+  }
+
+  function resetAll() {
+    Object.keys(readingsByMachine).forEach(restoreNormal);
+  }
+
   function advance(sensor) {
     const direction = Math.random() * 2 - 1;
     const nextValue = sensor.value + direction * sensor.step;
@@ -51,7 +68,7 @@ const SensorSimulator = (() => {
     sensor.value = Math.max(sensor.min, Math.min(sensor.max, sensor.value));
   }
 
-  function triggerDemoAnomaly(machineId, durationMs = 14000) {
+  function triggerDemoAnomaly(machineId) {
     const sensors = readingsByMachine[machineId];
     if (!sensors || machineId !== "M-B-002") return false;
     demoRestoreValues[machineId] = {
@@ -60,8 +77,15 @@ const SensorSimulator = (() => {
     };
     sensors.temperature.value = 93.2;
     sensors.vibration.value = 6.4;
-    demoAnomalyUntil[machineId] = Date.now() + durationMs;
+    // The demonstration incident stays latched until Normal Machine/reset.
+    demoAnomalyUntil[machineId] = Number.POSITIVE_INFINITY;
     return true;
+  }
+
+  function getIncidentId(machineId) {
+    return machineId === "M-B-002" && demoAnomalyUntil[machineId]
+      ? DEMO_INCIDENT_ID
+      : null;
   }
 
   function start(onUpdate) {
@@ -81,5 +105,5 @@ const SensorSimulator = (() => {
     }, UPDATE_INTERVAL_MS);
   }
 
-  return { getReadings, start, triggerDemoAnomaly };
+  return { getReadings, start, triggerDemoAnomaly, getIncidentId, restoreNormal, resetAll };
 })();

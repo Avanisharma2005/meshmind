@@ -17,6 +17,7 @@ from qdrant_edge import (
     Point,
     Query,
     QueryRequest,
+    ScrollRequest,
     UpdateOperation,
 )
 
@@ -48,17 +49,21 @@ DATA_DIR = BACKEND_DIR / "data"
 SHARD_PATH = DATA_DIR / "qdrant_edge"
 MACHINE_B_SHARD_PATH = DATA_DIR / "qdrant_edge_machine_b"
 MACHINE_C_SHARD_PATH = DATA_DIR / "qdrant_edge_machine_c"
+MACHINE_B_DEMO_SHARD_PATH = DATA_DIR / "qdrant_edge_demo_machine_b"
+MACHINE_C_DEMO_SHARD_PATH = DATA_DIR / "qdrant_edge_demo_machine_c"
 MODEL_CACHE_PATH = DATA_DIR / "models"
 
 
 class EdgeMemory:
-    def __init__(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        MODEL_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+    def __init__(self, data_dir: Path | None = None, model_cache_dir: Path | None = None) -> None:
+        self.data_dir = data_dir or DATA_DIR
+        model_cache_path = model_cache_dir or MODEL_CACHE_PATH
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        model_cache_path.mkdir(parents=True, exist_ok=True)
         # Runtime is local-only. Download/cache the model once using the README command.
         self._model = TextEmbedding(
             model_name=EMBEDDING_MODEL,
-            cache_dir=str(MODEL_CACHE_PATH),
+            cache_dir=str(model_cache_path),
             local_files_only=True,
         )
         self._lock = threading.RLock()
@@ -66,11 +71,15 @@ class EdgeMemory:
             vectors={VECTOR_NAME: EdgeVectorParams(size=VECTOR_SIZE, distance=Distance.Cosine)}
         )
         self._shards = {
-            "M-A-001": self._open_shard(SHARD_PATH),
-            "M-B-002": self._open_shard(MACHINE_B_SHARD_PATH),
+            "M-A-001": self._open_shard(self.data_dir / "qdrant_edge"),
+            "M-B-002": self._open_shard(self.data_dir / "qdrant_edge_machine_b"),
             # Machine C starts empty. It receives knowledge only through the
             # explicit Cloud retrieval/import operation.
-            "M-C-003": self._open_shard(MACHINE_C_SHARD_PATH),
+            "M-C-003": self._open_shard(self.data_dir / "qdrant_edge_machine_c"),
+        }
+        self._demo_shards = {
+            "M-B-002": self._open_shard(self.data_dir / "qdrant_edge_demo_machine_b"),
+            "M-C-003": self._open_shard(self.data_dir / "qdrant_edge_demo_machine_c"),
         }
         self._seed_once()
 
@@ -137,9 +146,9 @@ class EdgeMemory:
             )
             return records[0].payload if records else None
 
-    def get_memory_record(self, machine_id: str, reference_id: str) -> dict[str, Any] | None:
+    def get_memory_record(self, machine_id: str, reference_id: str, demo_mode: bool = False) -> dict[str, Any] | None:
         """Read one validated record from only the explicitly selected local shard."""
-        shard = self._shards.get(machine_id)
+        shard = self._demo_shards.get(machine_id) if demo_mode else self._shards.get(machine_id)
         if shard is None:
             return None
         with self._lock:
@@ -163,8 +172,8 @@ class EdgeMemory:
                 return None
             return {"id": str(getattr(record, "id", reference_id)), "payload": payload, "vector": list(vector)}
 
-    def search(self, machine_id: str, query_text: str) -> dict[str, Any] | None:
-        shard = self._shards.get(machine_id)
+    def search(self, machine_id: str, query_text: str, demo_mode: bool = False) -> dict[str, Any] | None:
+        shard = self._demo_shards.get(machine_id) if demo_mode else self._shards.get(machine_id)
         if shard is None:
             return None
         with self._lock:
@@ -185,8 +194,37 @@ class EdgeMemory:
                 "payload": hit.payload,
             }
 
+    def demo_memory_count(self, machine_id: str) -> int:
+        shard = self._demo_shards.get(machine_id)
+        if shard is None:
+            return 0
+        with self._lock:
+            return shard.count(CountRequest(exact=True))
+
+    def reset_demo_memories(self) -> dict[str, int]:
+        """Clear only the isolated demo shards; normal machine memories are untouched."""
+        counts: dict[str, int] = {}
+        with self._lock:
+            for machine_id, shard in self._demo_shards.items():
+                deleted = 0
+                offset = None
+                while True:
+                    records, next_offset = shard.scroll(ScrollRequest(
+                        offset=offset, limit=256, with_payload=False, with_vector=False,
+                    ))
+                    if records:
+                        ids = [record.id for record in records]
+                        shard.update(UpdateOperation.delete_points(ids))
+                        deleted += len(ids)
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+                shard.flush()
+                counts[machine_id] = deleted
+        return counts
+
     def import_cloud_knowledge(
-        self, cloud_point_id: str, payload: dict[str, Any], vector: list[float]
+        self, cloud_point_id: str, payload: dict[str, Any], vector: list[float], demo_mode: bool = False
     ) -> dict[str, Any]:
         """Import approved Cloud knowledge into Machine C only, idempotently."""
         machine_id = "M-C-003"
@@ -195,18 +233,22 @@ class EdgeMemory:
         point_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL, f"meshmind:{machine_id}:cloud:{cloud_point_id}"
         ))
+        source_machine_id = payload.get("source_machine_id", payload.get("source_machine", payload.get("machine_id")))
         local_payload = {
             **payload,
             "machine_id": machine_id,
             "machine_type": "Conveyor Motor",
             "source": "Qdrant Cloud",
+            "local_memory_reference_id": point_id,
+            "source_machine_id": source_machine_id,
+            "source_local_memory_reference_id": payload.get("local_memory_reference_id"),
             "source_cloud_point_id": cloud_point_id,
-            "imported_from_machine": payload.get("source_machine", payload.get("machine_id")),
+            "imported_from_machine": source_machine_id,
             "technician_confirmed": True,
             "confirmed": True,
         }
         with self._lock:
-            shard = self._shards[machine_id]
+            shard = self._demo_shards[machine_id] if demo_mode else self._shards[machine_id]
             existing = shard.retrieve(
                 point_ids=[point_id], with_payload=False, with_vector=False
             )
@@ -223,6 +265,7 @@ class EdgeMemory:
                 "machine_id": machine_id,
                 "local_memory_reference_id": point_id,
                 "source_cloud_point_id": cloud_point_id,
+                "source_machine_id": source_machine_id,
                 "memory_created": not bool(existing),
                 "memory_count": shard.count(CountRequest(exact=True)),
                 "payload": local_payload,
@@ -234,6 +277,8 @@ class EdgeMemory:
         evidence: dict[str, Any],
         original_recommendation: str,
         corrected: bool = False,
+        demo_mode: bool = False,
+        incident_id: str | None = None,
     ) -> dict[str, Any]:
         """Store a technician-validated Machine B incident in Machine B's shard only."""
         if not diagnosis.strip():
@@ -256,12 +301,15 @@ class EdgeMemory:
             f"pressure {machine_b['current_pressure']} bar. "
             f"Anomaly query: {query}"
         )
+        stable_incident_id = (incident_id or f"{machine_id}:{query}").strip()
         point_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"meshmind:{machine_id}:{query}:{diagnosis.strip().casefold()}",
+            f"meshmind:{machine_id}:incident:{stable_incident_id}",
         ))
         payload: dict[str, Any] = {
             "machine_id": machine_id,
+            "incident_id": stable_incident_id,
+            "memory_scope": "demo" if demo_mode else "machine",
             "machine_type": machine_b["machine_type"],
             "incident_type": diagnosis.strip(),
             "diagnosis": diagnosis.strip(),
@@ -279,7 +327,7 @@ class EdgeMemory:
             "ai_recommendation_rejected": corrected,
         }
         with self._lock:
-            shard_b = self._shards[machine_id]
+            shard_b = self._demo_shards[machine_id] if demo_mode else self._shards[machine_id]
             existing = shard_b.retrieve(
                 point_ids=[point_id], with_payload=True, with_vector=False
             )
@@ -294,17 +342,23 @@ class EdgeMemory:
                     )
                 )
                 shard_b.flush()
+            stored_payload = existing[0].payload if existing else payload
             return {
                 "machine_id": machine_id,
-                "incident_type": diagnosis.strip(),
+                "incident_type": stored_payload.get("incident_type", diagnosis.strip()),
+                "incident_id": stable_incident_id,
                 "local_memory_reference_id": point_id,
                 "memory_created": not bool(existing),
                 "technician_confirmed": True,
                 "memory_count": shard_b.count(CountRequest(exact=True)),
+                "memory_scope": "demo" if demo_mode else "machine",
             }
 
     def close(self) -> None:
         with self._lock:
             for shard in self._shards.values():
+                shard.flush()
+                shard.close()
+            for shard in self._demo_shards.values():
                 shard.flush()
                 shard.close()
