@@ -1,146 +1,743 @@
 # MeshMind
 
-## Independent local semantic memory (Steps 5–6)
+### Distributed AI Memory for Offline Industrial Machines
 
-MeshMind uses **Qdrant Edge** as an embedded local vector engine inside the Python backend process. Qdrant Edge is **not a Qdrant Server running on localhost**; localhost is used only for the small FastAPI interface that the browser calls.
+MeshMind is an offline-first AI memory system designed for industrial machines operating in environments where internet connectivity may be unreliable.
 
-Machine A and Machine B use separate persistent Edge shard directories: Machine A is stored in `backend/data/qdrant_edge/`, and Machine B in `backend/data/qdrant_edge_machine_b/`. The Machine A shard contains its one bearing race wear incident. Machine B's shard is initialized empty and does not receive Machine A's incident. The FastEmbed model is cached under `backend/data/models/`. These are local runtime data and are git-ignored.
+Instead of requiring every machine to continuously communicate with a cloud service, MeshMind gives machines **local semantic memory** and provides a **Gateway intelligence layer** for deciding how knowledge should be handled.
 
-The incident description is converted into a 384-dimensional embedding using FastEmbed's `sentence-transformers/all-MiniLM-L6-v2` model. The named `incident_text` vector uses cosine distance. For a semantic search, the submitted query is embedded with the same locally cached model and Qdrant Edge returns its nearest point and cosine similarity score. No embedding API or remote database is called at runtime.
+The prototype focuses on two core ideas:
 
-### Install dependencies (PowerShell)
+* **Local AI Memory** — machines can store and search operational knowledge locally.
+* **Gateway Intelligence** — a gateway classifies pending knowledge into appropriate handling categories.
 
-From the repository root:
+---
 
-```powershell
-python -m venv backend\.venv
-backend\.venv\Scripts\python -m pip install --upgrade pip
-backend\.venv\Scripts\python -m pip install -r backend\requirements.txt
+## The Problem
+
+Industrial environments such as underground mines contain machines that continuously generate operational data:
+
+* Temperature
+* Vibration
+* Current
+* Pressure
+* Error conditions
+
+Connectivity may be unreliable or unavailable.
+
+Imagine:
+
+> Machine A experienced a bearing failure in the past.
+
+Later:
+
+> Machine B develops a similar vibration and temperature pattern.
+
+If Machine B cannot reach the cloud, it may not have access to Machine A's previous experience.
+
+MeshMind addresses this by keeping useful machine knowledge available locally.
+
+---
+
+# Core Idea
+
+Traditional cloud-dependent architecture:
+
+```text
+Machine → Internet → Cloud → AI
 ```
 
-If Python 3.14 is not installed, substitute an installed Python version supported by the packages (for example `py -3.12`).
+MeshMind uses an offline-first architecture:
 
-### Download and cache the embedding model
-
-Run this once while internet access is available:
-
-```powershell
-cd backend
-.\.venv\Scripts\python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2', cache_dir='data/models')"
-cd ..
+```text
+             LOCAL AI MEMORY
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+      Machine A           Machine B
+          │                   │
+     Qdrant Edge          Qdrant Edge
+          │                   │
+          └──── Local Network ┘
+                    │
+                 Gateway
+                    │
+            Cloud when available
 ```
 
-The backend loads the model with `local_files_only=True`, so startup and search use the cache and do not make runtime model downloads. The first cache operation above fetches model files from the FastEmbed model source.
+The key principle is:
 
-### Start the backend
+> **The machine should remain useful even when the cloud is unavailable.**
 
-From the repository root, in one terminal:
+---
 
-```powershell
-cd backend
-.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
+# 1. Local AI Memory
+
+Each simulated machine has its own local semantic memory powered by Qdrant Edge.
+
+```text
+Machine A
+    │
+    └── Qdrant Edge
+           │
+           ├── Previous incidents
+           ├── Diagnoses
+           ├── Symptoms
+           └── Resolutions
 ```
 
-At startup the backend loads each existing shard, or creates it with `EdgeShard.create()`. It inserts Machine A's deterministic incident point only if it is absent; Machine B remains empty. Repeated restarts preserve the two separate stores and do not create duplicate points. The status endpoint returns the exact count for each machine.
+The system uses semantic search to find relevant historical incidents.
 
-### Start the frontend
+For example, a machine may detect:
 
-In another terminal at the repository root:
-
-```powershell
-python -m http.server 5500 --bind 127.0.0.1
+```text
+Vibration ↑
+Temperature ↑
+Current ↑
 ```
 
-Open <http://127.0.0.1:5500>. Machine A's Local Memory panel reads its status, count, and incident payload from the local API. If the backend is stopped, that panel reports `Local memory backend unavailable`; other dashboard sections continue to work.
+It can search its local memory for previous incidents with similar characteristics.
 
-### Verify independent machine memories
+A retrieved memory could contain:
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/api/memory/status
-Invoke-RestMethod http://127.0.0.1:8000/api/memory/machine/M-A-001
+```text
+Previous Incident
+-----------------
+Machine: Conveyor Motor
+Problem: Bearing race wear
+
+Symptoms:
+- Increased vibration
+- Increased temperature
+
+Resolution:
+Bearing replacement
+
+Technician status:
+Confirmed
 ```
 
-The status response has a `machines` array with each `machine_id`, `memory_backend`, and exact `memory_count`. Machine A starts with its historical record; Machines B and C start empty. Machine C uses `backend/data/qdrant_edge_machine_c`, separate from Machine A's `qdrant_edge` and Machine B's `qdrant_edge_machine_b`. The legacy top-level status fields still report Machine A for Step 5 callers.
+---
 
-### Test semantic search offline
+# 2. Local AI Explanation
 
-After installing dependencies and caching the model once, disconnect from the internet, start the backend and frontend, then send:
+MeshMind combines the current machine situation with retrieved historical knowledge.
 
-```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -ContentType 'application/json' -Body '{"machine_id":"M-A-001","query":"motor is vibrating and getting hot"}'
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/memory/search -ContentType 'application/json' -Body '{"machine_id":"M-B-002","query":"motor is vibrating and getting hot"}'
+The AI can produce an explanation such as:
+
+> "The current sensor pattern is similar to a previous conveyor motor incident involving bearing race wear."
+
+The flow is:
+
+```text
+Current Machine State
+        │
+        ▼
+Local Semantic Search
+        │
+        ▼
+Relevant Memory
+        │
+        ▼
+AI Explanation
+        │
+        ▼
+Technician
 ```
 
-The Machine A response contains `matching_incident`, `similarity_score`, and the stored `payload`. Machine B returns null match fields while its shard is empty. Each query is embedded locally and sent only to the Edge shard for the requested `machine_id`. Semantic search does not call an external embedding API or database.
+The AI provides an evidence-based recommendation. The technician remains responsible for physical inspection and confirmation.
 
-## Evidence-based AI explanation (Step 9)
+---
 
-After Machine B detects an anomaly and finishes its local search (and Machine A peer search when needed), FastAPI sends the structured evidence to Gemini using its Interactions REST API and JSON Schema output. The default model is `gemini-3.1-flash-lite`; set `GEMINI_MODEL` to override it. The backend restricts diagnoses to names supplied by the search evidence or `Insufficient evidence`, and restricts evidence bullets to facts built from the request. The historical Machine A incident is supporting evidence, not proof. If Gemini is unavailable or not configured, the backend returns a deterministic local-rules explanation with no confidence percentage. AI explanations are not generated on every simulator tick; the frontend deduplicates requests using the anomaly and material search/peer evidence.
+# 3. Separate Machine Memory
 
-Set the API key in the backend environment. The key stays on the server and is sent only as the Gemini API request header; it is never sent to browser JavaScript:
+MeshMind maintains separate Edge memory for different machines.
 
-```powershell
-$env:GEMINI_API_KEY = "your-api-key"
-$env:GEMINI_MODEL = "gemini-3.1-flash-lite" # optional; this is the default
-cd backend
-.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
+Example:
+
+```text
+Machine A
+└── backend/data/qdrant_edge/
+
+Machine B
+└── backend/data/qdrant_edge_machine_b/
 ```
 
-The `.env` patterns are already excluded by `.gitignore`; do not commit API keys. The `/api/ai/explain` endpoint returns HTTP 200 with `explanation_source: "local_rules"` and `ai_status: "not_configured"` when `GEMINI_API_KEY` is absent. Quota/rate-limit, authentication, timeout, and provider errors also use the local-rules fallback. No additional Python dependency is required.
+This allows each machine to maintain its own local memory rather than automatically sharing its entire database.
 
-## Gateway to Qdrant Cloud (Step 14)
+Relevant knowledge can be shared through the application's local communication workflow.
 
-The Gateway can synchronize approved, technician-validated local knowledge to a Qdrant Cloud collection. Configure all three values in the environment of the backend process; missing values safely leave the local queue unchanged and report `Cloud not configured`:
+---
 
-```powershell
-$env:QDRANT_CLOUD_URL = "https://your-cluster-endpoint"
-$env:QDRANT_CLOUD_API_KEY = "your-qdrant-cloud-api-key"
-$env:QDRANT_CLOUD_COLLECTION = "meshmind_global_memory"
-cd backend
-.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
+# 4. Gateway Intelligence
+
+MeshMind contains a local **Gateway intelligence layer**.
+
+The Gateway examines pending knowledge and determines how it should be handled.
+
+It does not blindly synchronize everything.
+
+The Gateway classifies pending records into five categories:
+
+```text
+SYNC NOW
+SYNC
+AGGREGATE
+SKIP
+LOCAL ONLY
 ```
 
-The configured collection is created on the first explicit synchronization if it does not exist. Its named `incident_text` vector uses the existing 384-dimensional FastEmbed embedding from the validated local Qdrant Edge point. No second model or local database is created. The backend never logs or returns the Cloud API key. `/api/gateway/status` performs a real collection reachability check; `POST /api/gateway/sync` is the only upload action. It reclassifies the local queue and uploads only `SYNC NOW` and `SYNC` decisions, with deterministic Cloud point IDs. Successful uploads alone transition their original queue records to `Synced`; failed uploads remain retryable as `Failed`. Duplicate Cloud IDs are checked before upload. The dashboard's Global Memory panel reads records back from the configured Cloud collection and does not infer global availability from the local queue.
+### SYNC NOW
 
-The status-area control can locally disable Cloud synchronization; enabling it again performs a backend reachability check. It cannot force Cloud to `ONLINE` when Qdrant Cloud is unreachable or unconfigured.
+Used for concrete technician-confirmed failures.
 
-Without Cloud configuration, all local Edge memory, semantic search, peer communication, technician validation, and queue records remain available. The Gateway reports the configuration failure and does not mark anything synchronized.
+```text
+Confirmed diagnosis
+        ↓
+    SYNC NOW
+```
 
-## Machine C Cloud knowledge retrieval (Step 15)
+### SYNC
 
-Machine C (`M-C-003`, Level 5, Conveyor Motor) starts with an empty independent Edge shard at `backend/data/qdrant_edge_machine_c`; startup does not seed bearing knowledge. Use **Retrieve Global Knowledge** while Machine C is selected to call `POST /api/machine-c/retrieve-global`. The backend reads pages from the configured existing Qdrant Cloud collection, accepts only technician-confirmed `SYNC NOW`/`SYNC` Conveyor Motor bearing wear/race/failure knowledge, and imports the Cloud point's existing `incident_text` vector and validated payload into Machine C's Edge shard. No Machine A/B Edge search or direct machine-to-machine copy occurs. Imported Edge point IDs are deterministic from the Cloud point ID, so repeating retrieval does not create another local point. The operation does not write to or alter Qdrant Cloud or its collection. Its response separates Cloud records retrieved, local imports, and the subsequent semantic search made only against Machine C's Edge shard. Cloud must be configured and online for retrieval; the local Machine C shard/search remain local when Cloud is unavailable.
+Used for useful validated patterns.
 
-### Test Step 9 from Git Bash
+### AGGREGATE
 
-Use the same evidence body for the three provider cases:
+Used for raw sensor streams or high-volume data that should be handled as aggregated information.
+
+### SKIP
+
+Used for duplicate information.
+
+### LOCAL ONLY
+
+Used for information that should remain local.
+
+Examples include:
+
+* Private technician notes
+* Insufficient evidence
+* Missing diagnosis
+* Local-only knowledge
+
+---
+
+# Gateway Decision Flow
+
+```text
+Pending Local Knowledge
+          │
+          ▼
+       Gateway
+          │
+     ┌────┼──────────────┐
+     │    │              │
+     ▼    ▼              ▼
+ SYNC   AGGREGATE       LOCAL ONLY
+ NOW
+     │
+     ├───────────────┐
+     ▼               ▼
+   SYNC             SKIP
+```
+
+The Gateway classification is deterministic and does not require an LLM.
+
+---
+
+# 5. Offline-First Operation
+
+When internet connectivity is unavailable:
+
+```text
+Internet ❌
+
+Machine
+   │
+   ├── Sensor data
+   ├── Anomaly detection
+   ├── Local memory
+   ├── Semantic search
+   └── Local AI explanation
+```
+
+The machine can continue using its local knowledge.
+
+Cloud services are not required for local memory and local retrieval.
+
+---
+
+# 6. Complete Prototype Flow
+
+```text
+        MACHINE A
+            │
+            ▼
+      Previous Incident
+            │
+            ▼
+       Qdrant Edge
+            │
+            ▼
+       Local Memory
+            │
+            │
+            ▼
+        MACHINE B
+            │
+       New Anomaly
+            │
+            ▼
+      Local Search
+            │
+            ▼
+     Relevant Knowledge
+            │
+            ▼
+       Local AI
+            │
+            ▼
+      Explanation
+            │
+            ▼
+       Technician
+            │
+            ▼
+      New Knowledge
+            │
+            ▼
+      Pending Queue
+            │
+            ▼
+         Gateway
+            │
+     ┌──────┼─────────┐
+     ▼      ▼         ▼
+   SYNC   SKIP    LOCAL ONLY
+```
+
+---
+
+# Technology Stack
+
+### Frontend
+
+* HTML
+* CSS
+* JavaScript
+
+### Backend
+
+* Python
+* FastAPI
+* Uvicorn
+
+### Local Vector Memory
+
+* Qdrant Edge
+* FastEmbed
+* `all-MiniLM-L6-v2` embeddings
+
+### AI
+
+* Gemini API
+
+### Gateway
+
+* Python-based deterministic classification layer
+
+---
+
+# Project Structure
+
+```text
+meshmind/
+│
+├── backend/
+│   ├── app.py
+│   ├── memory/
+│   │   └── edge_memory.py
+│   │
+│   └── data/
+│       ├── qdrant_edge/
+│       └── qdrant_edge_machine_b/
+│
+├── css/
+│   └── styles.css
+│
+├── js/
+│   └── app.js
+│
+├── index.html
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+---
+
+# Getting Started
+
+## Prerequisites
+
+Install:
+
+* Python 3.x
+* Git
+* A Gemini API key
+* Qdrant Cloud credentials if the cloud functionality is being used
+
+The project also requires the local embedding model used by FastEmbed.
+
+---
+
+# 1. Clone the Repository
+
+Clone the branch containing the current prototype:
 
 ```bash
-STEP9_BODY=$(cat <<'JSON'
-{"machine_b":{"machine_id":"M-B-002","machine_type":"Conveyor Motor","current_temperature":93.2,"current_vibration":6.4,"current_current":35.2,"current_pressure":5.1,"anomaly_state":"CRITICAL","triggered_sensors":["temperature","vibration"],"anomaly_query_description":"Conveyor Motor with increased vibration and elevated temperature"},"machine_b_local_search":{"useful_match_found":false,"matching_incident":null,"similarity_score":null},"machine_a_peer_knowledge":{"source_machine_id":"M-A-001","incident_type":"Bearing race wear","symptoms":["increased vibration","increased temperature"],"machine_type":"Conveyor Motor","resolution":"Machine inspected; bearing replacement required","technician_confirmed":true,"similarity_score":0.6028}}
-JSON
-)
+git clone -b developing --single-branch https://github.com/Avanisharma2005/meshmind.git
+cd meshmind
 ```
 
-For each case, start/restart the backend from a Git Bash terminal with that case's `GEMINI_API_KEY` environment. Run the `curl` command from another Git Bash terminal. Changing an environment variable in the curl terminal does not change an already-running backend process.
+---
 
-Case A — key missing:
+# 2. Install Python Dependencies
+
+From the project root:
 
 ```bash
-unset GEMINI_API_KEY
-curl -sS -w '\nHTTP %{http_code}\n' -X POST http://127.0.0.1:8000/api/ai/explain -H 'Content-Type: application/json' --data "$STEP9_BODY"
+pip install -r requirements.txt
 ```
 
-Expect HTTP 200, `explanation_source: "local_rules"`, `ai_status: "not_configured"`, a matched-check count, and no confidence percentage.
-
-Case B — Gemini key available:
+If your system uses `python` explicitly:
 
 ```bash
-export GEMINI_API_KEY='your-key-in-this-terminal-only'
-curl -sS -w '\nHTTP %{http_code}\n' -X POST http://127.0.0.1:8000/api/ai/explain -H 'Content-Type: application/json' --data "$STEP9_BODY"
+python -m pip install -r requirements.txt
 ```
 
-Expect HTTP 200 and `explanation_source: "gemini"`, `ai_status: "success"` when the model and account have quota. Keep the key private; do not paste it into chat or commit it.
+---
 
-Case C — quota/rate limit/provider failure:
+# 3. Configure API Credentials
 
-With a key configured, call the same command after Gemini reports quota/rate-limit exhaustion or is unavailable. Expect HTTP 200 and `explanation_source: "local_rules"`; `ai_status` will be `quota_exhausted`, `unavailable`, or another safe provider status. The response omits raw provider errors and secrets.
+**Never put API keys directly into the source code or README.**
+
+The repository contains:
+
+```text
+.env.example
+```
+
+Copy it to create your local environment file:
+
+```bash
+cp .env.example .env
+```
+
+On Windows Git Bash, the same command works.
+
+Your `.env` should contain your own credentials:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+
+QDRANT_CLOUD_URL=your_qdrant_cloud_url_here
+
+QDRANT_CLOUD_API_KEY=your_qdrant_cloud_api_key_here
+```
+
+### Important
+
+The actual `.env` file must **not** be committed to GitHub.
+
+Only `.env.example` should be shared.
+
+Each team member should use their own credentials or credentials provided securely by the project owner.
+
+---
+
+# 4. Start the Backend
+
+Open Git Bash:
+
+```bash
+cd ~/Downloads/meshmind/backend
+```
+
+Start FastAPI:
+
+```bash
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+The backend should start at:
+
+```text
+http://127.0.0.1:8000
+```
+
+Keep this terminal running.
+
+---
+
+# 5. Start the Frontend
+
+Open a second Git Bash terminal.
+
+From the project root:
+
+```bash
+cd ~/Downloads/meshmind
+```
+
+Start the frontend server:
+
+```bash
+python -m http.server 5500
+```
+
+Open the dashboard:
+
+```text
+http://127.0.0.1:5500
+```
+
+Keep this terminal running while using the application.
+
+---
+
+# Running Architecture
+
+Once both servers are running:
+
+```text
+Browser
+   │
+   │ :5500
+   ▼
+MeshMind Frontend
+   │
+   │ API requests
+   ▼
+FastAPI Backend
+   │
+   ├───────────────┐
+   ▼               ▼
+Qdrant Edge       Gemini
+Local Memory      AI Explanation
+   │
+   ▼
+Gateway
+Classification
+```
+
+---
+
+# Environment Variables
+
+| Variable               | Purpose                     | Required                              |
+| ---------------------- | --------------------------- | ------------------------------------- |
+| `GEMINI_API_KEY`       | AI explanations             | Yes for Gemini features               |
+| `QDRANT_CLOUD_URL`     | Qdrant Cloud endpoint       | Required only for cloud functionality |
+| `QDRANT_CLOUD_API_KEY` | Qdrant Cloud authentication | Required only for cloud functionality |
+
+The local Edge memory does not use the Qdrant Cloud API key for its local storage.
+
+---
+
+# Security
+
+## Never commit secrets
+
+Do **not** commit:
+
+```text
+.env
+```
+
+Do not put credentials in:
+
+```text
+app.py
+app.js
+README.md
+HTML files
+```
+
+The repository should contain only:
+
+```text
+.env.example
+```
+
+with placeholder values.
+
+Example:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+QDRANT_CLOUD_URL=your_qdrant_cloud_url_here
+QDRANT_CLOUD_API_KEY=your_qdrant_api_key_here
+```
+
+If an API key is accidentally committed to GitHub, **revoke/rotate it immediately** and replace it with a new key.
+
+---
+
+# Demo Scenario
+
+## Machine A
+
+```text
+Level 1
+Conveyor Motor
+```
+
+Machine A contains a previous incident:
+
+```text
+Bearing race wear
+```
+
+with symptoms such as:
+
+```text
+Increased vibration
+Increased temperature
+```
+
+and a confirmed resolution.
+
+---
+
+## Machine B
+
+```text
+Level 3
+Conveyor Motor
+```
+
+Machine B develops a similar anomaly.
+
+Its local memory is searched first.
+
+The system can then use relevant available knowledge to explain the similarity.
+
+Example:
+
+> "The current pattern is similar to a previous conveyor motor incident involving bearing race wear."
+
+A technician can inspect the machine and confirm or reject the recommendation.
+
+---
+
+# Gateway Demo
+
+After a technician-confirmed incident is recorded, the knowledge can enter the pending queue.
+
+The Gateway evaluates the pending records:
+
+```text
+Pending Knowledge
+       │
+       ▼
+    Gateway
+       │
+       ├── SYNC NOW
+       ├── SYNC
+       ├── AGGREGATE
+       ├── SKIP
+       └── LOCAL ONLY
+```
+
+This demonstrates that the system can distinguish between information that should be shared and information that should remain local.
+
+---
+
+# Why MeshMind?
+
+### Cloud-only AI
+
+```text
+Machine
+   ↓
+Internet
+   ↓
+Cloud
+   ↓
+AI
+```
+
+Connectivity failure can prevent access to cloud-based intelligence.
+
+### Isolated Edge AI
+
+```text
+Machine
+   ↓
+Local AI
+```
+
+The machine only has access to knowledge available locally.
+
+### MeshMind
+
+```text
+Machine
+   ↓
+Local Memory
+   ↓
+Local AI
+   ↓
+Gateway
+   ↓
+Cloud when available
+```
+
+MeshMind combines local memory with intelligent knowledge handling.
+
+---
+
+# Project Vision
+
+MeshMind demonstrates the foundation of a distributed AI memory system where machines can:
+
+1. Maintain local operational memory.
+2. Search that memory semantically.
+3. Use retrieved evidence to generate AI explanations.
+4. Continue operating when cloud connectivity is unavailable.
+5. Classify new knowledge through a Gateway.
+6. Decide which information should be synchronized or remain local.
+
+The central idea is:
+
+> **Machines should not only generate data. They should be able to remember useful experience and intelligently manage that knowledge.**
+
+---
+
+# Team Setup
+
+For a team using the repository:
+
+```text
+                    GitHub
+                       │
+              Clone developing branch
+                       │
+              ┌────────┴────────┐
+              │                 │
+          Teammate A         Teammate B
+              │                 │
+           .env              .env
+              │                 │
+        Own API keys       Own API keys
+              │                 │
+              └────────┬────────┘
+                       │
+                  MeshMind
+```
+
+The GitHub repository contains the application code.
+
+**Credentials remain outside the repository.**
