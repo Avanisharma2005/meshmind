@@ -18,6 +18,12 @@ const SensorSimulator = (() => {
       current: { value: 35.2, min: 27, max: 43, step: 0.55, unit: "A", range: "Simulated range: 27–43 A" },
       pressure: { value: 5.1, min: 3.8, max: 6.5, step: 0.07, unit: "bar", range: "Simulated range: 3.8–6.5 bar" },
     },
+    "M-C-003": {
+      temperature: { value: 65.5, min: 54, max: 77, step: 0.6, unit: "°C", range: "Simulated range: 54–77 °C" },
+      vibration: { value: 1.9, min: 0.7, max: 3.6, step: 0.1, unit: "mm/s", range: "Simulated range: 0.7–3.6 mm/s" },
+      current: { value: 30.8, min: 23, max: 39, step: 0.5, unit: "A", range: "Simulated range: 23–39 A" },
+      pressure: { value: 4.6, min: 3.4, max: 6.1, step: 0.06, unit: "bar", range: "Simulated range: 3.4–6.1 bar" },
+    },
   };
   const readingsByMachine = {};
   const demoAnomalyUntil = {};

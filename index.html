@@ -57,6 +57,72 @@
     <!-- ---- CONTENT COLUMN ---- -->
     <div class="content">
 
+      <!-- SYSTEM ARCHITECTURE OVERVIEW -->
+      <section class="panel architecture-panel" aria-labelledby="architecture-title">
+        <div class="visual-heading">
+          <div>
+            <div class="eyebrow">SYSTEM MAP</div>
+            <h1 id="architecture-title">MeshMind architecture</h1>
+            <p>Machines keep independent local memory. The Gateway classifies what may synchronize with shared Cloud memory.</p>
+          </div>
+          <div class="layer-legend" aria-label="Architecture layer colors">
+            <span class="legend-local">Local Edge</span><span class="legend-gateway">Gateway</span><span class="legend-cloud">Cloud</span>
+          </div>
+        </div>
+        <div class="architecture-map">
+          <div class="arch-cloud arch-node">
+            <span class="arch-kicker">SHARED KNOWLEDGE</span>
+            <strong>Qdrant Cloud</strong>
+            <span>Global Memory</span>
+          </div>
+          <div class="arch-link arch-link-cloud"><span>Approved sync ↗</span><i aria-hidden="true">↑</i></div>
+          <div class="arch-gateway arch-node">
+            <span class="arch-kicker">SYNC BOUNDARY</span>
+            <strong>Gateway</strong>
+            <span>Classifies local knowledge</span>
+          </div>
+          <div class="arch-link arch-link-gateway"><span>Local network ↕</span><i aria-hidden="true">↕</i></div>
+          <div class="arch-network arch-node">
+            <span class="arch-kicker">LOCAL MINING NETWORK</span>
+            <strong>Peer knowledge exchange</strong>
+            <span>Nearby machines can request and share relevant evidence</span>
+          </div>
+          <div class="arch-branches" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div class="arch-machines">
+            <article class="arch-machine"><span class="machine-index">MACHINE A</span><strong>Machine A</strong><span>Independent local store</span><div class="machine-edge"><b>Qdrant Edge</b><small>Machine A memory</small></div></article>
+            <article class="arch-machine"><span class="machine-index">MACHINE B</span><strong>Machine B</strong><span>Independent local store</span><div class="machine-edge"><b>Qdrant Edge</b><small>Machine B memory</small></div></article>
+            <article class="arch-machine"><span class="machine-index">MACHINE C</span><strong>Machine C</strong><span>Independent local store</span><div class="machine-edge"><b>Qdrant Edge</b><small>Machine C memory</small></div></article>
+          </div>
+          <div class="arch-link arch-link-edge"><i aria-hidden="true">↓</i><span>Local search &amp; memory</span></div>
+          <div class="arch-edge-band"><span>LOCAL EDGE</span><span>Each machine searches and stores in its own Qdrant Edge memory</span></div>
+        </div>
+      </section>
+
+      <!-- INCIDENT FLOW OVERVIEW -->
+      <section class="panel incident-flow-panel" aria-labelledby="incident-flow-title">
+        <div class="visual-heading flow-heading">
+          <div>
+            <div class="eyebrow">INCIDENT LIFECYCLE</div>
+            <h2 id="incident-flow-title">From anomaly to shared knowledge</h2>
+            <p>Evidence is found locally, reviewed by a technician, then queued for Gateway classification and Cloud synchronization.</p>
+          </div>
+          <span class="flow-direction">DETECTION → SYNCHRONIZATION</span>
+        </div>
+        <ol class="incident-flow" aria-label="Incident flow from sensor anomaly through cloud synchronization">
+          <li class="flow-step flow-detect"><span class="step-number">01</span><strong>Sensor anomaly</strong><small>Machine detects a change</small></li>
+          <li class="flow-step flow-local"><span class="step-number">02</span><strong>Local memory search</strong><small>Search this machine’s Edge memory</small></li>
+          <li class="flow-step flow-peer"><span class="step-number">03</span><strong>Peer knowledge request</strong><small>Ask nearby machines for evidence</small></li>
+          <li class="flow-step flow-evidence"><span class="step-number">04</span><strong>Retrieved evidence</strong><small>Combine relevant findings</small></li>
+          <li class="flow-step flow-ai"><span class="step-number">05</span><strong>AI analysis</strong><small>Explain the evidence</small></li>
+          <li class="flow-step flow-verify"><span class="step-number">06</span><strong>Technician verification</strong><small>Confirm or reject the finding</small></li>
+          <li class="flow-step flow-local"><span class="step-number">07</span><strong>Local memory</strong><small>Validated knowledge stays local</small></li>
+          <li class="flow-step flow-queue"><span class="step-number">08</span><strong>Sync queue</strong><small>Wait for Gateway processing</small></li>
+          <li class="flow-step flow-gateway"><span class="step-number">09</span><strong>Gateway</strong><small>Apply sync decision</small></li>
+          <li class="flow-step flow-cloud"><span class="step-number">10</span><strong>Cloud</strong><small>Approved knowledge is shared</small></li>
+        </ol>
+        <div class="flow-footnote"><span class="flow-local-key">LOCAL EDGE</span><span class="flow-gateway-key">GATEWAY</span><span class="flow-cloud-key">QDRANT CLOUD</span><span class="flow-policy">Only Gateway-approved items synchronize.</span></div>
+      </section>
+
       <!-- SENSOR MONITORING -->
       <section class="panel">
         <h2 class="panel-title">Sensor Monitoring</h2>
@@ -105,11 +171,32 @@
         </div>
       </section>
 
-      <!-- SYNCHRONIZATION -->
+      <!-- LOCAL SYNCHRONIZATION QUEUE -->
       <section class="panel">
-        <h2 class="panel-title">Synchronization</h2>
+        <h2 class="panel-title">Sync Queue</h2>
         <div id="sync-panel">
           <!-- populated by js/app.js: renderSync() -->
+        </div>
+      </section>
+
+      <section class="panel machine-c-learning-section" id="machine-c-learning-section" hidden>
+        <h2 class="panel-title">Machine C · Cloud Knowledge Retrieval</h2>
+        <div id="machine-c-learning-panel" aria-live="polite"></div>
+      </section>
+
+      <!-- LOCAL GATEWAY DECISIONS -->
+      <section class="panel">
+        <h2 class="panel-title">Gateway</h2>
+        <div id="gateway-panel">
+          <!-- populated by js/app.js: renderGateway() -->
+        </div>
+      </section>
+
+      <!-- QDRANT CLOUD GLOBAL MEMORY -->
+      <section class="panel">
+        <h2 class="panel-title">Global Memory</h2>
+        <div id="global-memory-panel">
+          <!-- populated only from records read from Qdrant Cloud -->
         </div>
       </section>
 

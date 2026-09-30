@@ -60,7 +60,7 @@ Invoke-RestMethod http://127.0.0.1:8000/api/memory/status
 Invoke-RestMethod http://127.0.0.1:8000/api/memory/machine/M-A-001
 ```
 
-The status response has a `machines` array with each `machine_id`, `memory_backend`, and exact `memory_count`. Machine A should report one memory and Machine B zero; the legacy top-level status fields still report Machine A for Step 5 callers.
+The status response has a `machines` array with each `machine_id`, `memory_backend`, and exact `memory_count`. Machine A starts with its historical record; Machines B and C start empty. Machine C uses `backend/data/qdrant_edge_machine_c`, separate from Machine A's `qdrant_edge` and Machine B's `qdrant_edge_machine_b`. The legacy top-level status fields still report Machine A for Step 5 callers.
 
 ### Test semantic search offline
 
@@ -75,15 +75,72 @@ The Machine A response contains `matching_incident`, `similarity_score`, and the
 
 ## Evidence-based AI explanation (Step 9)
 
-After Machine B detects an anomaly and finishes its own local search (and Machine A peer search when needed), FastAPI sends the structured sensor, anomaly, local-search, and peer-incident evidence to the OpenAI Responses API. The backend defaults to `gpt-6-astra` and uses Structured Outputs to require a validated JSON response. It constrains possible diagnoses to incident names in the supplied search evidence or `Insufficient evidence`, and limits evidence bullets to facts constructed from that request. The historical Machine A incident is supporting evidence, not proof. AI explanations are not generated on every simulator tick; the frontend deduplicates requests using the anomaly and material search/peer evidence.
+After Machine B detects an anomaly and finishes its local search (and Machine A peer search when needed), FastAPI sends the structured evidence to Gemini using its Interactions REST API and JSON Schema output. The default model is `gemini-3.1-flash-lite`; set `GEMINI_MODEL` to override it. The backend restricts diagnoses to names supplied by the search evidence or `Insufficient evidence`, and restricts evidence bullets to facts built from the request. The historical Machine A incident is supporting evidence, not proof. If Gemini is unavailable or not configured, the backend returns a deterministic local-rules explanation with no confidence percentage. AI explanations are not generated on every simulator tick; the frontend deduplicates requests using the anomaly and material search/peer evidence.
 
-Set the API key in the same PowerShell session used to start the backend. The key stays in the backend environment and is never sent to browser JavaScript:
+Set the API key in the backend environment. The key stays on the server and is sent only as the Gemini API request header; it is never sent to browser JavaScript:
 
 ```powershell
-$env:OPENAI_API_KEY = "your-api-key"
-$env:OPENAI_MODEL = "gpt-6-astra" # optional; defaults to gpt-6-astra
+$env:GEMINI_API_KEY = "your-api-key"
+$env:GEMINI_MODEL = "gemini-3.1-flash-lite" # optional; this is the default
 cd backend
 .\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-The `.env` patterns are already excluded by `.gitignore`; do not commit API keys. The `/api/ai/explain` endpoint returns HTTP 503 with a setup message when `OPENAI_API_KEY` is absent. No additional Python dependency is required for this API call.
+The `.env` patterns are already excluded by `.gitignore`; do not commit API keys. The `/api/ai/explain` endpoint returns HTTP 200 with `explanation_source: "local_rules"` and `ai_status: "not_configured"` when `GEMINI_API_KEY` is absent. Quota/rate-limit, authentication, timeout, and provider errors also use the local-rules fallback. No additional Python dependency is required.
+
+## Gateway to Qdrant Cloud (Step 14)
+
+The Gateway can synchronize approved, technician-validated local knowledge to a Qdrant Cloud collection. Configure all three values in the environment of the backend process; missing values safely leave the local queue unchanged and report `Cloud not configured`:
+
+```powershell
+$env:QDRANT_CLOUD_URL = "https://your-cluster-endpoint"
+$env:QDRANT_CLOUD_API_KEY = "your-qdrant-cloud-api-key"
+$env:QDRANT_CLOUD_COLLECTION = "meshmind_global_memory"
+cd backend
+.\.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+The configured collection is created on the first explicit synchronization if it does not exist. Its named `incident_text` vector uses the existing 384-dimensional FastEmbed embedding from the validated local Qdrant Edge point. No second model or local database is created. The backend never logs or returns the Cloud API key. `/api/gateway/status` performs a real collection reachability check; `POST /api/gateway/sync` is the only upload action. It reclassifies the local queue and uploads only `SYNC NOW` and `SYNC` decisions, with deterministic Cloud point IDs. Successful uploads alone transition their original queue records to `Synced`; failed uploads remain retryable as `Failed`. Duplicate Cloud IDs are checked before upload. The dashboard's Global Memory panel reads records back from the configured Cloud collection and does not infer global availability from the local queue.
+
+The status-area control can locally disable Cloud synchronization; enabling it again performs a backend reachability check. It cannot force Cloud to `ONLINE` when Qdrant Cloud is unreachable or unconfigured.
+
+Without Cloud configuration, all local Edge memory, semantic search, peer communication, technician validation, and queue records remain available. The Gateway reports the configuration failure and does not mark anything synchronized.
+
+## Machine C Cloud knowledge retrieval (Step 15)
+
+Machine C (`M-C-003`, Level 5, Conveyor Motor) starts with an empty independent Edge shard at `backend/data/qdrant_edge_machine_c`; startup does not seed bearing knowledge. Use **Retrieve Global Knowledge** while Machine C is selected to call `POST /api/machine-c/retrieve-global`. The backend reads pages from the configured existing Qdrant Cloud collection, accepts only technician-confirmed `SYNC NOW`/`SYNC` Conveyor Motor bearing wear/race/failure knowledge, and imports the Cloud point's existing `incident_text` vector and validated payload into Machine C's Edge shard. No Machine A/B Edge search or direct machine-to-machine copy occurs. Imported Edge point IDs are deterministic from the Cloud point ID, so repeating retrieval does not create another local point. The operation does not write to or alter Qdrant Cloud or its collection. Its response separates Cloud records retrieved, local imports, and the subsequent semantic search made only against Machine C's Edge shard. Cloud must be configured and online for retrieval; the local Machine C shard/search remain local when Cloud is unavailable.
+
+### Test Step 9 from Git Bash
+
+Use the same evidence body for the three provider cases:
+
+```bash
+STEP9_BODY=$(cat <<'JSON'
+{"machine_b":{"machine_id":"M-B-002","machine_type":"Conveyor Motor","current_temperature":93.2,"current_vibration":6.4,"current_current":35.2,"current_pressure":5.1,"anomaly_state":"CRITICAL","triggered_sensors":["temperature","vibration"],"anomaly_query_description":"Conveyor Motor with increased vibration and elevated temperature"},"machine_b_local_search":{"useful_match_found":false,"matching_incident":null,"similarity_score":null},"machine_a_peer_knowledge":{"source_machine_id":"M-A-001","incident_type":"Bearing race wear","symptoms":["increased vibration","increased temperature"],"machine_type":"Conveyor Motor","resolution":"Machine inspected; bearing replacement required","technician_confirmed":true,"similarity_score":0.6028}}
+JSON
+)
+```
+
+For each case, start/restart the backend from a Git Bash terminal with that case's `GEMINI_API_KEY` environment. Run the `curl` command from another Git Bash terminal. Changing an environment variable in the curl terminal does not change an already-running backend process.
+
+Case A — key missing:
+
+```bash
+unset GEMINI_API_KEY
+curl -sS -w '\nHTTP %{http_code}\n' -X POST http://127.0.0.1:8000/api/ai/explain -H 'Content-Type: application/json' --data "$STEP9_BODY"
+```
+
+Expect HTTP 200, `explanation_source: "local_rules"`, `ai_status: "not_configured"`, a matched-check count, and no confidence percentage.
+
+Case B — Gemini key available:
+
+```bash
+export GEMINI_API_KEY='your-key-in-this-terminal-only'
+curl -sS -w '\nHTTP %{http_code}\n' -X POST http://127.0.0.1:8000/api/ai/explain -H 'Content-Type: application/json' --data "$STEP9_BODY"
+```
+
+Expect HTTP 200 and `explanation_source: "gemini"`, `ai_status: "success"` when the model and account have quota. Keep the key private; do not paste it into chat or commit it.
+
+Case C — quota/rate limit/provider failure:
+
+With a key configured, call the same command after Gemini reports quota/rate-limit exhaustion or is unavailable. Expect HTTP 200 and `explanation_source: "local_rules"`; `ai_status` will be `quota_exhausted`, `unavailable`, or another safe provider status. The response omits raw provider errors and secrets.
