@@ -33,9 +33,13 @@ class TechnicalGateway:
         self._mdns: Any = None
         self._mdns_browser: Any = None
         self._mdns_service: Any = None
+        self._mdns_thread: threading.Thread | None = None
+        self._mdns_stop = threading.Event()
         self._discovered: dict[str, dict[str, Any]] = {}
-        self.mdns_status = "not_configured"
-        self.mdns_message = "mDNS discovery is not available."
+        self.mdns_configured = True
+        self.mdns_status = "starting"
+        self.mdns_message = "mDNS registration and discovery are starting in the background."
+        self.mdns_error: str | None = None
         self.api_port = self._int_env("MESHMIND_API_PORT", 8000, 1, 65535)
 
     @staticmethod
@@ -48,7 +52,10 @@ class TechnicalGateway:
     def start(self) -> None:
         if self.mqtt_configured:
             self._start_mqtt()
-        self._start_mdns()
+        self._mdns_thread = threading.Thread(
+            target=self._run_mdns, name="meshmind-mdns", daemon=True,
+        )
+        self._mdns_thread.start()
 
     def _start_mqtt(self) -> None:
         try:
@@ -214,12 +221,13 @@ class TechnicalGateway:
         if self.mqtt_connected:
             self.publish("meshmind/machine/M-B-002/anomaly", payload)
 
-    def _start_mdns(self) -> None:
+    def _run_mdns(self) -> None:
         try:
-            from zeroconf import ServiceBrowser, ServiceInfo, ServiceStateChange, Zeroconf
+            from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
         except ImportError:
             self.mdns_status = "unavailable"
             self.mdns_message = "mDNS is unavailable because dependency zeroconf is not installed; use configured MQTT broker host/port."
+            self.mdns_error = "zeroconf is not installed"
             return
         try:
             addresses = sorted({
@@ -236,18 +244,32 @@ class TechnicalGateway:
                 properties={"service": "meshmind", "role": "gateway", "identity": "Gateway"},
                 server=f"{socket.gethostname()}.local.",
             )
+            # Zeroconf is synchronous and may wait on network operations. Keep
+            # registration and teardown on this worker, away from ASGI's loop.
             self._mdns.register_service(self._mdns_service)
             self._mdns_browser = ServiceBrowser(
                 self._mdns, service_type, handlers=[self._on_service_change],
             )
             self.mdns_status = "available"
             self.mdns_message = "Gateway service registered and local MeshMind service discovery is active."
+            self.mdns_error = None
+            self._mdns_stop.wait()
         except Exception as exc:
             self.mdns_status = "unavailable"
+            self.mdns_error = f"{type(exc).__name__}: {exc}"
             self.mdns_message = f"mDNS registration/discovery failed: {type(exc).__name__}; use configured MQTT broker host/port."
+        finally:
             if self._mdns is not None:
-                self._mdns.close()
-                self._mdns = None
+                try:
+                    if self._mdns_service is not None and self.mdns_status == "available":
+                        self._mdns.unregister_service(self._mdns_service)
+                    self._mdns.close()
+                except Exception as exc:
+                    self.mdns_error = f"{type(exc).__name__}: {exc}"
+                    self.mdns_status = "unavailable"
+                    self.mdns_message = f"mDNS shutdown failed: {type(exc).__name__}."
+                finally:
+                    self._mdns = None
 
     def _on_service_change(self, zeroconf: Any, service_type: str, name: str, state_change: Any) -> None:
         try:
@@ -284,8 +306,10 @@ class TechnicalGateway:
                     "last_anomaly_event": self._last_anomaly,
                 },
                 "mdns": {
+                    "configured": self.mdns_configured,
                     "status": self.mdns_status, "available": self.mdns_status == "available",
-                    "message": self.mdns_message, "service_name": getattr(self._mdns_service, "name", None),
+                    "message": self.mdns_message, "error": self.mdns_error,
+                    "service_name": getattr(self._mdns_service, "name", None),
                     "services": services,
                     "fallback": {"host": self.mqtt_host or None, "port": self.mqtt_port if self.mqtt_configured else None},
                 },
@@ -298,10 +322,4 @@ class TechnicalGateway:
                 self.client.loop_stop()
             except Exception:
                 pass
-        if self._mdns is not None:
-            try:
-                if self._mdns_service is not None:
-                    self._mdns.unregister_service(self._mdns_service)
-                self._mdns.close()
-            except Exception:
-                pass
+        self._mdns_stop.set()

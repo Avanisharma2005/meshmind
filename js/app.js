@@ -188,6 +188,7 @@ function renderHeaderStatus() {
   const el = document.getElementById("header-status");
   const cloudOffline = cloudStatusSetting !== "CONNECTED";
   const mesh = meshServiceState || {};
+  renderDistributedNetwork(mesh);
   const mqtt = mesh.mqtt || {};
   const mdns = mesh.mdns || {};
   const ai = aiServiceState || {};
@@ -233,6 +234,59 @@ function renderHeaderStatus() {
     }
     setCloudControl("ONLINE").catch(() => {});
   });
+}
+
+function renderDistributedNetwork(mesh = meshServiceState || {}) {
+  const el = document.getElementById("distributed-network");
+  if (!el) return;
+  const mqtt = mesh.mqtt || {};
+  const mdns = mesh.mdns || {};
+  const services = Array.isArray(mdns.services) ? mdns.services : [];
+  const ownService = services.find((service) => service.name === mdns.service_name)
+    || null;
+  const statusLabel = (status) => ({
+    connected: "CONNECTED", not_configured: "NOT CONFIGURED", disconnected: "DISCONNECTED",
+    error: "ERROR", available: "AVAILABLE", starting: "STARTING", unavailable: "UNAVAILABLE",
+  })[String(status || "").toLowerCase()] || "UNAVAILABLE";
+  const statusClass = (status) => ({
+    connected: "online", available: "online", starting: "pending", not_configured: "inactive",
+    disconnected: "offline", unavailable: "offline", error: "offline",
+  })[String(status || "").toLowerCase()] || "pending";
+  const value = (item) => item === null || item === undefined || item === "" ? "—" : String(item);
+  const detail = (label, item) => `<div class="network-detail"><span>${label}</span><strong>${escapeHTML(value(item))}</strong></div>`;
+  const anomaly = mqtt.last_anomaly_event;
+  const anomalyText = anomaly ? (typeof anomaly === "string" ? anomaly : JSON.stringify(anomaly)) : "No anomaly event reported";
+  const addressList = Array.isArray(mdns.lan_address) ? mdns.lan_address.join(", ")
+    : Array.isArray(ownService?.addresses) ? ownService.addresses.join(", ") : mdns.lan_address;
+  el.innerHTML = `
+    <article class="network-card mqtt-card">
+      <div class="network-card-heading">
+        <div><span class="network-kicker">MQTT MESH</span><h3>${statusLabel(mqtt.status)}</h3></div>
+        <span class="network-indicator ${statusClass(mqtt.status)}" aria-hidden="true"></span>
+      </div>
+      <p class="network-message">${escapeHTML(value(mqtt.message))}</p>
+      <div class="network-details">
+        ${detail("Broker host", mqtt.host)}
+        ${detail("Broker port", mqtt.port)}
+        ${detail("Client ID", mqtt.client_id)}
+      </div>
+      <div class="network-event"><span>Last anomaly event</span><pre>${escapeHTML(anomalyText)}</pre></div>
+    </article>
+    <article class="network-card mdns-card">
+      <div class="network-card-heading">
+        <div><span class="network-kicker">mDNS DISCOVERY</span><h3>${statusLabel(mdns.status)}</h3></div>
+        <span class="network-indicator ${statusClass(mdns.status)}" aria-hidden="true"></span>
+      </div>
+      <p class="network-message">${escapeHTML(value(mdns.message))}</p>
+      <div class="network-details">
+        ${detail("Service name", mdns.service_name)}
+        ${detail("Gateway hostname", mdns.gateway_hostname ?? ownService?.host)}
+        ${detail("LAN address", addressList)}
+        ${detail("Gateway port", mdns.gateway_port ?? ownService?.port)}
+        ${detail("Identity", mdns.identity ?? ownService?.identity)}
+      </div>
+      ${mdns.error ? `<div class="network-error"><span>Error</span><strong>${escapeHTML(mdns.error)}</strong></div>` : ""}
+    </article>`;
 }
 
 function loadServiceStatus() {
@@ -571,6 +625,16 @@ function renderAI() {
     return;
   }
   if (state.status !== "complete") {
+    if (state.status === "running") {
+      const ai = aiServiceState || {};
+      const provider = String(ai.provider || "").toLowerCase();
+      const model = ai.model ? ` · ${ai.model}` : "";
+      const progress = provider === "ollama"
+        ? `Local AI · Ollama${model}`
+        : `AI${provider ? ` · ${provider}` : ""}${model}`;
+      el.innerHTML = `<div class="badge cyan">${escapeHTML(progress)}</div><div class="memory-unavailable">Analyzing machine and peer evidence...</div>`;
+      return;
+    }
     el.innerHTML = `<div class="memory-unavailable">${escapeHTML(state.error || state.status)}</div>`;
     return;
   }

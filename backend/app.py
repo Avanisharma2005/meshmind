@@ -583,7 +583,10 @@ def mesh_status() -> dict[str, Any]:
         return {
             "gateway": {"status": "unavailable", "message": "Gateway service has not started."},
             "mqtt": {"status": "unavailable", "connected": False, "message": "Gateway service has not started."},
-            "mdns": {"status": "unavailable", "available": False, "message": "Gateway service has not started."},
+            "mdns": {
+                "configured": False, "status": "unavailable", "available": False,
+                "message": "Gateway service has not started.", "error": None,
+            },
         }
     return technical_gateway.status()
 
@@ -1505,7 +1508,7 @@ def explain_anomaly(request: AIExplainRequest) -> AIExplanationResponse:
     if selected_provider == "ollama":
         try:
             explanation, model, latency_ms = explain_with_ollama(
-                request.model_dump(mode="json"), candidates, facts, confidence_ceiling,
+                candidates, facts, confidence_ceiling,
             )
         except LocalAIError as exc:
             logger.error("[AI] request failed provider=ollama elapsed_ms=%d error=%s", int((time.perf_counter() - started) * 1000), exc)
