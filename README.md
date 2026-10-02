@@ -1,4 +1,4 @@
-# MeshMind
+[# MeshMind
 
 ## Independent local semantic memory (Steps 5–6)
 
@@ -144,3 +144,4 @@ Expect HTTP 200 and `explanation_source: "gemini"`, `ai_status: "success"` when 
 Case C — quota/rate limit/provider failure:
 
 With a key configured, call the same command after Gemini reports quota/rate-limit exhaustion or is unavailable. Expect HTTP 200 and `explanation_source: "local_rules"`; `ai_status` will be `quota_exhausted`, `unavailable`, or another safe provider status. The response omits raw provider errors and secrets.
+](https://github.com/Avanisharma2005/meshmind)
