@@ -2,3 +2,6 @@ qdrant-edge-py==0.8.0
 fastembed
 fastapi
 uvicorn
+python-dotenv>=1.0,<2
+paho-mqtt>=2.1,<3
+zeroconf>=0.140

@@ -10,32 +10,32 @@
 
 // ---- App state --------------------------------------------------------
 let selectedMachineId = MESH_DATA.machines[0].id;
-let cloudStatusSetting = "OFFLINE";
+let cloudStatusSetting = "CHECKING";
 let cloudStatusMessage = "Cloud status has not been checked.";
+let cloudSyncFailed = false;
 let cloudLocallyDisabled = false;
+let meshServiceState = null;
+let aiServiceState = null;
 
-// Per-machine UI state that isn't "real" data yet, just interaction state
-// for this shell (technician verification decision, sync in-progress flag).
-const uiState = {};
 const localSearchState = {};
+const localSearchRequests = {};
+const peerRequests = {};
+const aiRequests = new Set();
+const aiRequestControllers = new Map();
 let peerCommunicationState = null;
 let aiExplanationState = null;
 const verificationStates = {};
+const technicianDecisionRequests = new Set();
 let syncQueueState = null;
 let gatewayState = null;
 let gatewayRequestSequence = 0;
+let demoGeneration = 0;
 let gatewaySyncInProgress = false;
 let globalMemoryState = null;
 let machineCRetrievalState = { status: "idle", result: null, error: null };
 let gatewaySyncMessage = "";
 let lastGatewaySyncItems = [];
 let demoFeedback = { message: "Ready. Choose an action to run its real system flow.", kind: "" };
-MESH_DATA.machines.forEach((m) => {
-  uiState[m.id] = {
-    syncStatus: m.sync.status, // synced | pending | local_only | syncing
-  };
-});
-
 function getSelectedMachine() {
   return MESH_DATA.machines.find((m) => m.id === selectedMachineId);
 }
@@ -68,7 +68,6 @@ function buildLocalSearchQuery(machine, readings, anomaly) {
     const reading = readings[key];
     if (!reading) return;
     if (triggered.has(key)) behavior.push(`${describeSensorBehavior(key, reading, true)} (${reading.value.toFixed(1)} ${reading.unit})`);
-    else if (key === "current") behavior.push(`current draw ${reading.value.toFixed(1)} ${reading.unit} (within normal range)`);
   });
   const sensorText = behavior.length ? behavior.join(" and ") : "abnormal sensor behavior";
   const anomalyType = anomaly.triggeredSensors.map((sensor) => `${sensor.sensor.toLowerCase()} anomaly`).join(" and ");
@@ -89,15 +88,24 @@ function updateLocalSearch() {
   }
   const query = buildLocalSearchQuery(machine, SensorSimulator.getReadings(machine.id), anomaly);
   const current = localSearchState[machine.id];
-  if (current?.query === query && (current.status.startsWith("Searching") || current.result)) return;
+  if (current?.query === query) return;
   peerCommunicationState = null;
-  runLocalMemorySearch(machine, query, true, true);
+  aiExplanationState = null;
+  localSearchState[machine.id] = { query, status: "Ready for local search", result: null };
 }
 
-function runLocalMemorySearch(machine, query, continueIncidentFlow = false, demoMode = machine.id === "M-B-002") {
-  localSearchState[machine.id] = { query, status: `Searching ${machine.name} local Qdrant Edge memory`, result: null, manual: !continueIncidentFlow };
+function runLocalMemorySearch(machine, query, demoMode = machine.id === "M-B-002") {
+  if (localSearchRequests[machine.id]?.query === query) return localSearchRequests[machine.id].promise;
+  if (machine.id === "M-B-002") {
+    peerCommunicationState = null;
+    aiExplanationState = null;
+  }
+  localSearchState[machine.id] = { query, status: `Searching ${machine.name} local Qdrant Edge memory`, result: null };
   if (getSelectedMachine().id === machine.id) renderLocalSearch();
-  fetch("http://127.0.0.1:8000/api/memory/search", {
+  const started = performance.now();
+  const generation = demoGeneration;
+  console.info(`[MeshMind] local search start machine=${machine.id}`);
+  const promise = fetch("http://127.0.0.1:8000/api/memory/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ machine_id: machine.id, query, demo_mode: demoMode }),
@@ -105,7 +113,7 @@ function runLocalMemorySearch(machine, query, continueIncidentFlow = false, demo
     if (!response.ok) throw new Error("Local memory search unavailable");
     return response.json();
   }).then((result) => {
-    if (localSearchState[machine.id]?.query !== query) return;
+    if (generation !== demoGeneration || localSearchState[machine.id]?.query !== query) return;
     localSearchState[machine.id] = {
       query,
       status: "Search complete",
@@ -114,18 +122,23 @@ function runLocalMemorySearch(machine, query, continueIncidentFlow = false, demo
     const matchMessage = result.matching_incident
       ? `Local Edge search found ${result.matching_incident} (similarity ${Number(result.similarity_score).toFixed(4)}).`
       : `Local Edge search completed for ${machine.name}; no useful match was returned.`;
+    console.info(`[MeshMind] local search end machine=${machine.id} elapsed_ms=${Math.round(performance.now() - started)} found=${Boolean(result.matching_incident)}`);
     reportDemoAction(matchMessage);
-    if (continueIncidentFlow && machine.id === "M-B-002") {
-      if (result.matching_incident) explainCurrentEvidence(query, result, null);
-      else askMachineA(query);
-    }
     if (getSelectedMachine().id === machine.id) renderLocalSearch();
+    return result;
   }).catch(() => {
-    if (localSearchState[machine.id]?.query !== query) return;
+    if (generation !== demoGeneration || localSearchState[machine.id]?.query !== query) return;
     localSearchState[machine.id] = { query, status: "Local memory backend unavailable", result: null, error: true };
+    console.error(`[MeshMind] local search error machine=${machine.id} elapsed_ms=${Math.round(performance.now() - started)}`);
     reportDemoAction(`${machine.name} local Edge search failed: local memory backend unavailable.`, "error");
     if (getSelectedMachine().id === machine.id) renderLocalSearch();
+    throw new Error("Local memory backend unavailable");
   });
+  localSearchRequests[machine.id] = { query, promise };
+  promise.finally(() => {
+    if (localSearchRequests[machine.id]?.promise === promise) delete localSearchRequests[machine.id];
+  }).catch(() => {});
+  return promise;
 }
 
 function reportDemoAction(message, kind = "success") {
@@ -149,19 +162,21 @@ function setCloudControl(state) {
   }).then(async (response) => {
     const result = await response.json();
     if (!response.ok) throw new Error(result.detail || `Cloud ${state} control failed`);
-    cloudStatusSetting = result.cloud_status === "online" ? "ONLINE" : "OFFLINE";
-    cloudLocallyDisabled = state === "OFFLINE" || result.cloud_status !== "online";
+    cloudStatusSetting = result.connection_state || (result.cloud_status === "online" ? "CONNECTED" : result.cloud_status === "not_configured" ? "NOT CONFIGURED" : "CONFIGURED BUT UNREACHABLE");
+    cloudSyncFailed = false;
+    cloudLocallyDisabled = result.connection_state === "OFFLINE";
     cloudStatusMessage = result.message || `Cloud ${cloudStatusSetting}.`;
     renderHeaderStatus();
     renderSync();
     renderGateway();
     globalMemoryState = null;
     loadGlobalMemory();
+    loadCloudStatus();
     return result;
   }).catch((error) => {
     cloudStatusSetting = "OFFLINE";
     cloudStatusMessage = error.message;
-    cloudLocallyDisabled = true;
+    cloudLocallyDisabled = state === "OFFLINE";
     renderHeaderStatus();
     renderSync();
     renderGateway();
@@ -171,32 +186,75 @@ function setCloudControl(state) {
 
 function renderHeaderStatus() {
   const el = document.getElementById("header-status");
-  const cloudOffline = cloudStatusSetting === "OFFLINE";
+  const cloudOffline = cloudStatusSetting !== "CONNECTED";
+  const mesh = meshServiceState || {};
+  const mqtt = mesh.mqtt || {};
+  const mdns = mesh.mdns || {};
+  const ai = aiServiceState || {};
+  const statusDot = (status) => ({
+    connected: "green", available: "green", ready: "green", configured: "amber", model_missing: "amber",
+    not_configured: "grey", unavailable: "red", disconnected: "red", misconfigured: "red",
+  })[status] || "amber";
+  const statusValue = (status) => ({
+    connected: "CONNECTED", available: "AVAILABLE", ready: "READY", configured: "CONFIGURED",
+    model_missing: "MODEL MISSING", not_configured: "NOT CONFIGURED", unavailable: "UNAVAILABLE",
+    disconnected: "DISCONNECTED", misconfigured: "MISCONFIGURED",
+  })[status] || "CHECKING";
+  const pill = (label, value, message, status) => `
+    <div class="status-pill service-status" title="${escapeHTML(message || "Status unavailable")}">
+      <span class="dot ${statusDot(status)}"></span>
+      <span class="status-copy"><span class="label">${escapeHTML(label)}</span> <span class="value">${escapeHTML(value)}</span>
+        <span class="status-note">${escapeHTML(message || "Checking backend service…")}</span></span>
+    </div>`;
+  const aiStatus = ai.selected ? ai.status : "unavailable";
+  const inferenceStatus = aiExplanationState?.status === "running" ? "INFERENCE RUNNING"
+    : aiExplanationState?.status === "complete" ? "INFERENCE SUCCESSFUL"
+      : aiExplanationState?.status === "error" ? "INFERENCE FAILED" : null;
+  const aiValue = inferenceStatus || (aiStatus === "connected" ? `OLLAMA AVAILABLE · ${ai.model || "Ollama"}`
+    : aiStatus === "configured" ? `CONFIGURED · ${ai.model || "Gemini"}` : statusValue(aiStatus));
   el.innerHTML = `
-    <div class="status-pill cloud-status-card" aria-live="polite">
-      <span class="dot ${cloudStatusSetting === "CHECKING" ? "amber" : cloudOffline ? "red" : "green"}"></span>
+      <div class="status-pill cloud-status-card" aria-live="polite">
+      <span class="dot ${cloudStatusSetting === "CHECKING" || cloudStatusSetting === "CONFIGURED BUT UNREACHABLE" ? "amber" : cloudOffline ? "red" : "green"}"></span>
       <div class="status-copy">
-        <div><span class="label">CLOUD</span> <span class="value">${cloudStatusSetting}</span></div>
+        <div><span class="label">QDRANT CLOUD</span> <span class="value">${cloudSyncFailed ? "SYNCHRONIZATION FAILED" : cloudStatusSetting}</span></div>
         <div class="status-note">${escapeHTML(cloudStatusMessage)}</div>
       </div>
-      <button id="cloud-status-action" class="status-toggle" type="button">${cloudStatusSetting === "ONLINE" ? "SET OFFLINE" : "CHECK / CONNECT"}</button>
+      <button id="cloud-status-action" class="status-toggle" type="button">${cloudStatusSetting === "CONNECTED" && !cloudLocallyDisabled ? "SET OFFLINE" : "CHECK / CONNECT"}</button>
     </div>
-    <div class="status-pill">
-      <span class="dot cyan"></span>
-      <span class="status-copy"><span class="label">LOCAL MESH</span> <span class="value">ONLINE</span></span>
-    </div>
-    <div class="status-pill">
-      <span class="dot green"></span>
-      <span class="status-copy"><span class="label">LOCAL INTELLIGENCE</span> <span class="value">ACTIVE</span></span>
-    </div>
+    ${pill("GATEWAY", statusValue(mesh.gateway?.status), mesh.gateway?.message || "Backend Gateway status", mesh.gateway?.status)}
+    ${pill("MQTT MESH", statusValue(mqtt.status), mqtt.message, mqtt.status)}
+    ${pill("mDNS", statusValue(mdns.status), mdns.message, mdns.status)}
+    ${pill(`AI · ${String(ai.provider || "provider").toUpperCase()}`, aiValue, ai.message, aiStatus)}
   `;
   document.getElementById("cloud-status-action").addEventListener("click", () => {
-    if (cloudStatusSetting === "ONLINE") {
+    if (cloudStatusSetting === "CONNECTED" && !cloudLocallyDisabled) {
       setCloudControl("OFFLINE").catch(() => {});
       return;
     }
     setCloudControl("ONLINE").catch(() => {});
   });
+}
+
+function loadServiceStatus() {
+  const requests = [
+    fetch("http://127.0.0.1:8000/api/mesh/status").then(async (response) => {
+      if (!response.ok) throw new Error("Mesh status request failed");
+      meshServiceState = await response.json();
+    }).catch((error) => {
+      meshServiceState = {
+        gateway: { status: "unavailable", message: error.message },
+        mqtt: { status: "unavailable", message: "Backend mesh status could not be reached." },
+        mdns: { status: "unavailable", message: "Backend mesh status could not be reached." },
+      };
+    }),
+    fetch("http://127.0.0.1:8000/api/ai/status").then(async (response) => {
+      if (!response.ok) throw new Error("AI status request failed");
+      aiServiceState = await response.json();
+    }).catch((error) => {
+      aiServiceState = { provider: "unknown", status: "unavailable", message: error.message };
+    }),
+  ];
+  Promise.all(requests).then(renderHeaderStatus);
 }
 
 function loadCloudStatus(enableCloudSync = false) {
@@ -209,15 +267,16 @@ function loadCloudStatus(enableCloudSync = false) {
     if (!response.ok) throw new Error("Cloud status check unavailable");
     return response.json();
   }).then((status) => {
-    cloudStatusSetting = status.cloud_status === "online" ? "ONLINE" : "OFFLINE";
-    cloudLocallyDisabled = status.message === "Cloud synchronization is disabled locally" || status.cloud_status !== "online";
-    cloudStatusMessage = status.message || (cloudStatusSetting === "ONLINE" ? "Qdrant Cloud reachable." : "Cloud synchronization unavailable.");
+    cloudStatusSetting = status.connection_state || (status.cloud_status === "online" ? "CONNECTED" : status.cloud_status === "not_configured" ? "NOT CONFIGURED" : "OFFLINE");
+    cloudSyncFailed = false;
+    cloudLocallyDisabled = status.connection_state === "OFFLINE";
+    cloudStatusMessage = status.message || (cloudStatusSetting === "CONNECTED" ? "Qdrant Cloud reachable." : "Cloud synchronization unavailable.");
     renderHeaderStatus();
     renderSync();
     renderGateway();
   }).catch((error) => {
     cloudStatusSetting = "OFFLINE";
-    cloudStatusMessage = error.message;
+    cloudStatusMessage = `Cloud status check failed: ${error.message}`;
     renderHeaderStatus();
   });
 }
@@ -264,7 +323,10 @@ function renderMachineDetail() {
       <div class="anomaly-title">ANOMALY DETECTED · ${anomaly.state}</div>
       <div class="anomaly-time">Detected ${new Date(anomaly.timestamp).toLocaleTimeString()}</div>
       <ul class="anomaly-sensors">
-        ${anomaly.triggeredSensors.map((item) => `<li>${item.sensor}: ${item.value.toFixed(1)} ${item.unit} (threshold ${item.threshold} ${item.unit}) — ${item.state}</li>`).join("")}
+        ${anomaly.triggeredSensors.map((item) => {
+          const unit = item.sensorKey === "temperature" ? "\u00B0C" : item.unit;
+          return `<li>${item.sensor}: ${item.value.toFixed(1)} ${unit} (threshold ${item.threshold} ${unit}) — ${item.state}</li>`;
+        }).join("")}
       </ul>
     </div>
   ` : "";
@@ -296,22 +358,31 @@ function renderSensors() {
   const sensors = SensorSimulator.getReadings(getSelectedMachine().id);
   const anomaly = AnomalyDetector.getState(getSelectedMachine().id);
   const triggeredKeys = new Set(anomaly.triggeredSensors.map((sensor) => sensor.sensorKey));
+  const severityBySensor = new Map(anomaly.triggeredSensors.map((sensor) => [sensor.sensorKey, sensor.state]));
 
   const labels = {
-    temperature: "Temperature",
-    vibration: "Vibration",
-    current: "Current",
-    pressure: "Pressure",
+    temperature: "Simulated motor temperature",
+    vibration: "Simulated vibration velocity",
+    current: "Simulated motor current",
+    pressure: "Simulated pressure",
   };
 
   el.innerHTML = Object.entries(sensors)
-    .map(([key, s]) => `
-      <div class="sensor-card ${triggeredKeys.has(key) ? `anomaly-sensor ${anomaly.state.toLowerCase()}` : ""}">
-        <div class="s-label">${labels[key]}</div>
-        <div class="s-value">${s.value.toFixed(1)}<span class="s-unit">${s.unit}</span></div>
-        <div class="s-range">${s.range}</div>
-      </div>
-    `)
+    .map(([key, s]) => {
+      const unit = key === "temperature" ? "\u00B0C" : s.unit;
+      const severity = severityBySensor.get(key);
+      const outsideRange = s.value < s.min || s.value > s.max;
+      const status = severity || (outsideRange ? "OUTSIDE NORMAL RANGE" : "NORMAL");
+      const statusClass = severity ? severity.toLowerCase() : outsideRange ? "outside" : "normal";
+      return `
+        <div class="sensor-card ${triggeredKeys.has(key) ? `anomaly-sensor ${severity.toLowerCase()}` : ""}">
+          <div class="s-label">${labels[key]}</div>
+          <div class="s-value">${s.value.toFixed(1)}<span class="s-unit">${unit}</span></div>
+          <div class="s-range">Normal range: ${s.min} &ndash; ${s.max} ${unit}</div>
+          <div class="s-status ${statusClass}">Status: ${status}</div>
+        </div>
+      `;
+    })
     .join("");
 }
 
@@ -336,9 +407,9 @@ function renderMemory() {
   }).then(({ status, machineMemory, payload }) => {
     if (getSelectedMachine().id !== machineId) return;
     el.innerHTML = `
-      <div class="memory-backend-status"><span class="dot ${status.status === "online" ? "green" : "red"}"></span><strong>Local Memory: ${status.status.toUpperCase()}</strong></div>
+      <div class="memory-backend-status"><span class="dot ${status.status === "online" ? "green" : "red"}"></span><strong>${status.status.toUpperCase()}</strong></div>
       <div class="detail-row"><span class="k">Memory Owner</span><span class="v">${machineMemory.machine_id}</span></div>
-      <div class="detail-row"><span class="k">Memory Backend</span><span class="v">${machineMemory.memory_backend}</span></div>
+      <div class="detail-row"><span class="k">Backend</span><span class="v">${machineMemory.memory_backend}</span></div>
       <div class="detail-row"><span class="k">Stored Memories</span><span class="v">${machineMemory.memory_count}</span></div>
       ${payload ? `
         <div class="info-box memory-incident">
@@ -352,7 +423,7 @@ function renderMemory() {
             return `<li>${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}</li>`;
           }).join("")}<li>Diagnosis ${payload.confirmed ? "confirmed" : "not confirmed"}</li></ul>
         </div>
-      ` : `<div class="info-box memory-incident"><div class="i-title">Historical Incident</div><div class="memory-empty">No useful historical memory</div></div>`}
+      ` : `<div class="memory-empty">No local memories yet.</div>`}
     `;
   }).catch(() => {
     if (getSelectedMachine().id !== machineId) return;
@@ -391,7 +462,7 @@ function renderPeers() {
   const el = document.getElementById("peer-panel");
   const state = getSelectedMachine().id === "M-B-002" ? peerCommunicationState : null;
   if (!state) {
-    el.textContent = "No peer search performed yet.";
+    el.innerHTML = '<div class="detail-row"><span class="k">Peer request</span><span class="v">NOT REQUESTED</span></div>';
     return;
   }
   const history = state.steps.map((step) => `<div class="detail-row"><span class="k">${step.machine}</span><span class="v">${step.state}</span></div>`).join("");
@@ -406,13 +477,30 @@ function renderPeers() {
       <div class="detail-row"><span class="k">Similarity score</span><span class="v">${Number(state.knowledge.similarity_score).toFixed(4)}</span></div>
     </div>
   ` : "";
-  el.innerHTML = `${history}${state.error ? `<div class="memory-unavailable">${state.error}</div>` : ""}${knowledge}`;
+  const peerStatus = state.status === "searching" ? "SEARCHING" : state.status === "found" ? "EVIDENCE FOUND" : state.status === "none" ? "NO EVIDENCE" : state.status === "failed" ? "REQUEST FAILED" : "SEARCHING";
+  el.innerHTML = `<div class="detail-row"><span class="k">Peer request</span><span class="v">${peerStatus}</span></div>${history}${state.error ? `<div class="memory-unavailable">${state.error}</div>` : ""}${knowledge}`;
 }
 
 function askMachineA(query) {
-  if (peerCommunicationState?.query === query) return;
+  if (peerRequests[query]) return peerRequests[query];
+  if (peerCommunicationState?.query === query && peerCommunicationState.steps.some((step) => step.state === "KNOWLEDGE RECEIVED")) return;
+  const machine = MESH_DATA.machines.find((item) => item.id === "M-B-002");
+  const local = localSearchState[machine.id];
+  if (!local || local.query !== query || !local.result) {
+    const search = localSearchRequests[machine.id]?.query === query
+      ? localSearchRequests[machine.id].promise
+      : runLocalMemorySearch(machine, query, true);
+    return search.then(() => askMachineA(query)).catch((error) => {
+      reportDemoAction(`Local search must finish before peer knowledge can be requested: ${error.message}`, "error");
+    });
+  }
+  if (local.result.matching_incident) {
+    reportDemoAction(`Machine B local Edge search found ${local.result.matching_incident}; peer search was not needed.`);
+    return;
+  }
   peerCommunicationState = {
     query,
+    status: "searching",
     steps: [
       { machine: "Machine B", state: "ASKING NEARBY MACHINE" },
       { machine: "Machine A", state: "SEARCHING LOCAL MEMORY" },
@@ -420,8 +508,11 @@ function askMachineA(query) {
     knowledge: null,
     error: null,
   };
+  const generation = demoGeneration;
   if (getSelectedMachine().id === "M-B-002") renderPeers();
-  fetch("http://127.0.0.1:8000/api/machine-a/ask", {
+  const started = performance.now();
+  console.info("[MeshMind] peer request start requester=M-B-002 target=M-A-001");
+  const promise = fetch("http://127.0.0.1:8000/api/machine-a/ask", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ requesting_machine_id: "M-B-002", query }),
@@ -429,7 +520,8 @@ function askMachineA(query) {
     if (!response.ok) throw new Error("Machine A knowledge service unavailable");
     return response.json();
   }).then((knowledge) => {
-    if (peerCommunicationState?.query !== query) return;
+    if (generation !== demoGeneration || peerCommunicationState?.query !== query) return;
+    console.info(`[MeshMind] peer request end elapsed_ms=${Math.round(performance.now() - started)} found=${Boolean(knowledge.found)}`);
     peerCommunicationState.steps = [
       { machine: "Machine B", state: "ASKING NEARBY MACHINE" },
       { machine: "Machine A", state: "SEARCHING LOCAL MEMORY" },
@@ -438,6 +530,7 @@ function askMachineA(query) {
       { machine: "Machine B", state: "KNOWLEDGE RECEIVED" },
     ];
     peerCommunicationState.knowledge = knowledge.found ? knowledge : null;
+    peerCommunicationState.status = knowledge.found ? "found" : "none";
     peerCommunicationState.error = knowledge.found ? null : "Machine A found no useful local match.";
     reportDemoAction(knowledge.found
       ? `Machine A returned ${knowledge.incident_type} as peer evidence (similarity ${Number(knowledge.similarity_score).toFixed(4)}).`
@@ -445,16 +538,20 @@ function askMachineA(query) {
     explainCurrentEvidence(query, localSearchState["M-B-002"]?.result, knowledge.found ? knowledge : null);
     if (getSelectedMachine().id === "M-B-002") renderPeers();
   }).catch((error) => {
-    if (peerCommunicationState?.query !== query) return;
+    if (generation !== demoGeneration || peerCommunicationState?.query !== query) return;
+    console.error(`[MeshMind] peer request error elapsed_ms=${Math.round(performance.now() - started)} error=${error.message}`);
     peerCommunicationState.steps = [
       { machine: "Machine B", state: "ASKING NEARBY MACHINE" },
       { machine: "Machine A", state: "SEARCHING LOCAL MEMORY" },
     ];
     peerCommunicationState.error = error.message;
+    peerCommunicationState.status = "failed";
     reportDemoAction(`Machine A peer request failed: ${error.message}`, "error");
-    explainCurrentEvidence(query, localSearchState["M-B-002"]?.result, null);
     if (getSelectedMachine().id === "M-B-002") renderPeers();
   });
+  peerRequests[query] = promise;
+  promise.finally(() => { delete peerRequests[query]; }).catch(() => {});
+  return promise;
 }
 
 // ---- Render: AI recommendation ------------------------------------------
@@ -482,19 +579,19 @@ function renderAI() {
   const sensors = evidence.machine_b;
   const local = evidence.machine_b_local_search;
   const peer = evidence.machine_a_peer_knowledge;
-  const explanationLabel = result.explanation_source === "gemini"
-    ? "AI-generated (Gemini)"
-    : `Rule-based fallback (AI unavailable: ${state.aiStatusMessage})`;
-  const confidenceMarkup = result.explanation_source === "gemini"
-    ? `<div class="confidence-block"><div class="confidence-value">${result.confidence}%</div><div class="confidence-label">Evidence confidence</div><div class="confidence-bar"><div class="confidence-bar-fill" style="width:${result.confidence}%"></div></div></div>`
-    : `<div class="confidence-block"><div class="confidence-value">${result.evidence_matched.matched} / ${result.evidence_matched.total}</div><div class="confidence-label">Evidence matched</div></div>`;
+  const explanationLabel = result.explanation_source === "ollama"
+    ? `Local AI · Ollama${result.model ? ` · ${result.model}` : ""}`
+    : `AI · Gemini${result.model ? ` · ${result.model}` : ""}`;
+  const confidence = Math.max(0, Math.min(100, Number(result.confidence ?? 0)));
+  const confidenceMarkup = `<div class="confidence-block"><div class="confidence-value">${confidence}%</div><div class="confidence-label">Evidence confidence</div><div class="confidence-bar"><div class="confidence-bar-fill" style="width:${confidence}%"></div></div></div>`;
   el.innerHTML = `
     <div class="ai-head">
       <div>
-        <div class="badge ${result.explanation_source === "gemini" ? "cyan" : "amber"}">${escapeHTML(explanationLabel)}</div>
+        <div class="badge cyan">${escapeHTML(explanationLabel)}</div>
         <div class="ai-sub">Possible diagnosis</div>
         <div class="ai-diagnosis">${escapeHTML(result.possible_diagnosis)}</div>
         <div class="ai-sub">Generated from the supplied machine and memory evidence; historical similarity is not proof.</div>
+        <div class="ai-sub">Provider: ${escapeHTML(result.provider || result.explanation_source || "Unknown")} · Model: ${escapeHTML(result.model || "Unknown")} · Latency: ${result.latency_ms == null ? "Unavailable" : `${escapeHTML(result.latency_ms)} ms`}</div>
       </div>
       ${confidenceMarkup}
     </div>
@@ -509,6 +606,7 @@ function renderAI() {
     </div>
     <div class="i-title ai-section-title">Evidence</div>
     <ul class="evidence-list">${result.evidence.map((fact) => `<li>${escapeHTML(fact)}</li>`).join("")}</ul>
+    ${result.reasoning ? `<div class="info-box"><div class="i-title">AI reasoning</div><div>${escapeHTML(result.reasoning)}</div></div>` : ""}
     <div class="action-box">
       <div class="a-label">Recommendation</div>
       <div>${escapeHTML(result.recommendation)}</div>
@@ -570,24 +668,41 @@ function explainCurrentEvidence(query, localResult, peerKnowledge) {
   };
   const fingerprint = explanationEvidenceFingerprint(evidence);
   if (aiExplanationState?.fingerprint === fingerprint) return;
-  aiExplanationState = { fingerprint, status: "Generating evidence-based explanation…", evidence, result: null, error: null };
+  if (aiRequests.has(fingerprint)) return;
+  aiRequests.add(fingerprint);
+  aiExplanationState = { fingerprint, status: "running", evidence, result: null, error: null };
   if (getSelectedMachine().id === machine.id) { renderAI(); renderVerification(); }
-  fetch("http://127.0.0.1:8000/api/ai/explain", {
+  const started = performance.now();
+  console.info(`[MeshMind] AI request start provider=${aiServiceState?.provider || "configured"}`);
+  const controller = new AbortController();
+  aiRequestControllers.set(fingerprint, controller);
+  const timeout = setTimeout(() => controller.abort(), 135000);
+  const request = fetch("http://127.0.0.1:8000/api/ai/explain", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(evidence),
+    signal: controller.signal,
   }).then(async (response) => {
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || "AI explanation unavailable");
     return body;
   }).then((result) => {
     if (aiExplanationState?.fingerprint !== fingerprint) return;
+    console.info(`[MeshMind] AI request end elapsed_ms=${Math.round(performance.now() - started)} latency_ms=${result.latency_ms ?? "unavailable"} diagnosis=${result.possible_diagnosis}`);
     aiExplanationState = { fingerprint, status: "complete", evidence, result, aiStatusMessage: result.ai_status_message, error: null };
     if (getSelectedMachine().id === machine.id) { renderAI(); renderVerification(); }
   }).catch((error) => {
     if (aiExplanationState?.fingerprint !== fingerprint) return;
-    aiExplanationState = { fingerprint, status: "error", evidence, result: null, error: error.message };
+    console.error(`[MeshMind] AI request error elapsed_ms=${Math.round(performance.now() - started)} error=${error.message}`);
+    const message = error.name === "AbortError"
+      ? "AI request timed out. Check that Ollama is running with gemma3:4b, then run the flow again."
+      : `AI explanation failed: ${error.message}. Check the backend and Ollama status, then retry.`;
+    aiExplanationState = { fingerprint, status: "error", evidence, result: null, error: message };
     if (getSelectedMachine().id === machine.id) { renderAI(); renderVerification(); }
+  }).finally(() => {
+    clearTimeout(timeout);
+    aiRequestControllers.delete(fingerprint);
+    aiRequests.delete(fingerprint);
   });
 }
 
@@ -702,6 +817,7 @@ function retrieveGlobalKnowledgeForMachineC(onComplete = null) {
   }).then((result) => {
     machineCRetrievalState = { status: "complete", result, error: null };
     if (onComplete) onComplete(result);
+    loadCloudStatus();
     return result;
   }).catch((error) => {
     machineCRetrievalState = { status: "error", result: null, error: error.message };
@@ -719,6 +835,8 @@ function submitTechnicianDecision(state, decision, diagnosis, onComplete = null)
     if (onComplete) onComplete(null, new Error(current.error));
     return;
   }
+  if (technicianDecisionRequests.has(state.fingerprint)) return;
+  technicianDecisionRequests.add(state.fingerprint);
   const prior = verificationStates[state.fingerprint] || {};
   verificationStates[state.fingerprint] = { ...prior, pending: decision === "rejected" ? "Recording technician rejection…" : "Saving technician decision…", error: null };
   renderVerification();
@@ -729,6 +847,9 @@ function submitTechnicianDecision(state, decision, diagnosis, onComplete = null)
       machine_id: "M-B-002",
       decision,
       original_recommendation: state.result.possible_diagnosis,
+      ai_recommendation: state.result.recommendation || "",
+      ai_reasoning: state.result.reasoning || "",
+      ai_confidence: state.result.confidence ?? null,
       diagnosis: diagnosis.trim(),
       evidence: state.evidence,
     }),
@@ -761,9 +882,14 @@ function submitTechnicianDecision(state, decision, diagnosis, onComplete = null)
     renderVerification();
     if (onComplete) onComplete(result);
   }).catch((error) => {
-    verificationStates[state.fingerprint] = { ...verificationStates[state.fingerprint], pending: null, error: error.message };
-    renderVerification();
+    verificationStates[state.fingerprint] = { ...verificationStates[state.fingerprint], error: error.message };
     if (onComplete) onComplete(null, error);
+  }).finally(() => {
+    technicianDecisionRequests.delete(state.fingerprint);
+    if (verificationStates[state.fingerprint]?.pending) {
+      verificationStates[state.fingerprint] = { ...verificationStates[state.fingerprint], pending: null };
+    }
+    renderVerification();
   });
 }
 
@@ -788,51 +914,42 @@ function renderSync() {
   if (!syncQueueState) loadSyncQueue();
   const queue = syncQueueState || { loading: true, entries: [], pending_sync_count: 0 };
   const pendingCount = Number(queue.pending_sync_count || 0);
+  const processingCount = Number(queue.processing_count || 0);
+  const syncedCount = Number(queue.synced_count || 0);
+  const failedCount = Number(queue.failed_count || 0);
   const queueStatus = queue.error
     ? "Queue unavailable"
     : queue.loading
       ? "Loading local queue"
       : pendingCount > 0
-        ? (cloudStatusSetting === "OFFLINE"
+        ? (cloudStatusSetting !== "CONNECTED"
           ? "Waiting for connectivity"
           : "Ready for Gateway synchronization")
         : "No validated incidents waiting for sync";
   const actualRows = (queue.entries || []).map((entry) => `
     <tr>
-      <td>${escapeHTML(entry.queue_category)}</td>
-      <td>${escapeHTML(entry.machine_id)}</td>
       <td>${escapeHTML(entry.incident_type)}</td>
-      <td>${escapeHTML(entry.sync_status)}</td>
-      <td>${escapeHTML(entry.last_sync_error || entry.cloud_record_id || "Local queue")}</td>
-    </tr>
-  `).join("");
-  const exampleRows = [
-    ["Sync Now", "Eligible validated incident example"],
-    ["Aggregate", "Related vibration and temperature notes"],
-    ["Duplicate", "Repeated incident fingerprint example"],
-    ["Local Only", "Technician note retained on this device"],
-  ].map(([category, incident]) => `
-    <tr class="queue-demo-row">
-      <td>${category}</td><td>M-B-002</td><td>${incident}</td><td>Example only</td><td>Demo — not persisted</td>
+      <td>${escapeHTML(entry.machine_id)}</td>
+      <td>${escapeHTML(entry.queue_category || "Technician validation")}</td>
+      <td>${escapeHTML(entry.sync_status === "Pending Sync" ? "Pending" : entry.sync_status)}</td>
+      <td>${escapeHTML(entry.updated_at || entry.created_at || "")}</td>
     </tr>
   `).join("");
 
   el.innerHTML = `
     <div class="queue-summary">
-      <div class="queue-count"><span>Pending Sync:</span> <strong>${queue.error ? "—" : pendingCount}</strong></div>
+      <div class="queue-count"><span>Pending:</span> <strong>${queue.error ? "—" : pendingCount}</strong></div>
+      <div class="queue-count"><span>Processing:</span> <strong>${queue.error ? "—" : processingCount}</strong></div>
+      <div class="queue-count"><span>Synced:</span> <strong>${queue.error ? "—" : syncedCount}</strong></div>
+      <div class="queue-count"><span>Failed:</span> <strong>${queue.error ? "—" : failedCount}</strong></div>
       <div class="queue-status"><span>Status:</span> <strong>${escapeHTML(queueStatus)}</strong></div>
     </div>
     ${queue.error ? `<div class="memory-unavailable">${escapeHTML(queue.error)}. <button id="retry-sync-queue" class="btn btn-primary">Retry</button></div>` : ""}
-    <div class="queue-notice">The queue remains local and retryable. Only approved Gateway decisions are sent to Qdrant Cloud after you choose SYNC NOW. Static examples are excluded from the pending count.</div>
-    <div class="i-title">Local queue entries</div>
+    <div class="queue-notice">The queue remains local and retryable. Only approved Gateway decisions are sent to Qdrant Cloud after you choose SYNC NOW.</div>
+    <div class="i-title">Live Queue</div>
     <div class="queue-table-wrap"><table class="queue-table">
-      <thead><tr><th>Category</th><th>Machine</th><th>Incident</th><th>Status</th><th>Record</th></tr></thead>
-      <tbody>${actualRows || '<tr><td colspan="5" class="queue-empty">No actual validated incidents are queued.</td></tr>'}</tbody>
-    </table></div>
-    <div class="i-title queue-demo-title">Category examples — demo only</div>
-    <div class="queue-table-wrap"><table class="queue-table">
-      <thead><tr><th>Category</th><th>Machine</th><th>Incident</th><th>Status</th><th>Record</th></tr></thead>
-      <tbody>${exampleRows}</tbody>
+      <thead><tr><th>Incident</th><th>Machine</th><th>Decision</th><th>Status</th><th>Updated</th></tr></thead>
+      <tbody>${actualRows || '<tr><td colspan="5" class="queue-empty">No persisted runtime records.</td></tr>'}</tbody>
     </table></div>
   `;
   const retryButton = document.getElementById("retry-sync-queue");
@@ -898,10 +1015,10 @@ function renderGateway() {
   el.innerHTML = `
     <div class="gateway-boundary">
       <div><strong>Gateway: LOCAL CLASSIFICATION ACTIVE</strong></div>
-      <div>Qdrant Cloud: ${cloudStatusSetting === "ONLINE" ? "ONLINE" : cloudStatusSetting === "CHECKING" ? "CHECKING" : "OFFLINE"}</div>
+      <div>Qdrant Cloud: ${escapeHTML(cloudSyncFailed ? "SYNCHRONIZATION FAILED" : cloudStatusSetting)}</div>
       <div>Only SYNC NOW and SYNC items are eligible. SKIP, AGGREGATE and LOCAL ONLY remain on the device.</div>
     </div>
-    <div class="gateway-pending">Pending Items: <strong>${gatewayState.error ? "—" : Number(gatewayState.pending_items || 0)}</strong></div>
+    <div class="gateway-pending">Pending Items: <strong>${gatewayState.error ? "—" : Number(syncQueueState?.pending_sync_count || 0)}</strong></div>
     <div class="gateway-summary gateway-sync-summary">
       <div class="gateway-count"><span>Processing:</span><strong>${processingCount}</strong></div>
       <div class="gateway-count"><span>Synced:</span><strong>${syncedCount}</strong></div>
@@ -909,7 +1026,7 @@ function renderGateway() {
     </div>
     <div class="gateway-actions">
       <button id="gateway-sync-now" class="btn btn-primary" type="button" ${gatewaySyncInProgress ? "disabled" : ""}>${gatewaySyncInProgress ? "PROCESSING…" : "SYNC NOW"}</button>
-      <span>${escapeHTML(gatewaySyncMessage || (cloudStatusSetting === "OFFLINE" ? "Synchronization waits for a successful cloud connection." : "Synchronization runs only after this action."))}</span>
+      <span>${escapeHTML(gatewaySyncMessage || (cloudStatusSetting !== "CONNECTED" ? "Synchronization waits for a successful cloud connection." : "Synchronization runs only after this action."))}</span>
     </div>
     <div class="i-title">Decision Summary</div>
     <div class="gateway-summary">${decisionSummary}</div>
@@ -941,12 +1058,16 @@ function syncGatewayNow() {
     if (!response.ok) return response.json().then((body) => { throw new Error(body.detail || "Gateway synchronization failed"); });
     return response.json();
   }).then((result) => {
-    cloudStatusSetting = result.cloud_status === "online" || result.cloud_status === "online_with_failures" ? "ONLINE" : "OFFLINE";
+    cloudSyncFailed = Number(result.failed || 0) > 0 || result.cloud_status === "online_with_failures";
+    cloudStatusSetting = result.cloud_status === "online" || result.cloud_status === "online_with_failures" ? "CONNECTED" : result.cloud_status === "not_configured" ? "NOT CONFIGURED" : "OFFLINE";
     cloudStatusMessage = result.cloud_message || (result.cloud_status === "not_configured" ? "Cloud not configured." : "Gateway synchronization finished.");
     gatewaySyncMessage = result.cloud_message || `Processed ${result.processed}: ${result.synced} synced, ${result.duplicates} duplicate(s), ${result.failed} failed.`;
     lastGatewaySyncItems = result.items || [];
     reportDemoAction(`Gateway synchronization returned ${result.cloud_status}: ${gatewaySyncMessage} Processed ${result.processed}; ${result.synced} synced, ${result.failed} failed.`, result.failed ? "error" : "success");
   }).catch((error) => {
+    cloudSyncFailed = true;
+    cloudStatusSetting = cloudStatusSetting === "NOT CONFIGURED" ? "NOT CONFIGURED" : "OFFLINE";
+    cloudStatusMessage = `Synchronization failed: ${error.message}`;
     gatewaySyncMessage = error.message;
     reportDemoAction(`Gateway synchronization failed: ${error.message}`, "error");
   }).finally(() => {
@@ -958,6 +1079,7 @@ function syncGatewayNow() {
     loadSyncQueue();
     loadGateway(true);
     loadGlobalMemory();
+    loadCloudStatus();
   });
 }
 
@@ -1020,13 +1142,13 @@ function runDemoAction(action) {
     selectedMachineId = "M-B-002";
     evaluateMachineAnomalies();
     renderAll();
-    reportDemoAction("Machine B is at its real demo anomaly readings. Detection ran and the existing local search flow has started.");
+    reportDemoAction("Machine B is at its real demo anomaly readings. Detection ran; click Search Local Memory to query its Edge shard.");
     return;
   }
   if (action === "search") {
     const query = selectedMachineQuery(machine);
-    runLocalMemorySearch(machine, query, false, machine.id === "M-B-002");
-    reportDemoAction(`Sent a semantic-search request for ${machine.name} (${machine.id}) to its local Qdrant Edge shard.`);
+    runLocalMemorySearch(machine, query, machine.id === "M-B-002");
+    reportDemoAction(`Searching ${machine.name} (${machine.id}) local Qdrant Edge memory.`);
     return;
   }
   if (action === "peer") {
@@ -1035,7 +1157,7 @@ function runDemoAction(action) {
     const query = localSearchState[peerMachine.id]?.query || selectedMachineQuery(peerMachine);
     renderAll();
     askMachineA(query);
-    reportDemoAction("Sent the existing Machine B → Machine A peer knowledge request; awaiting the real response.");
+    reportDemoAction("Started the existing Machine B → Machine A peer knowledge request; awaiting the real response.");
     return;
   }
   if (action === "confirm" || action === "reject") {
@@ -1084,31 +1206,39 @@ function runDemoAction(action) {
     return;
   }
   if (action === "reset") {
-    SensorSimulator.resetAll();
-    evaluateMachineAnomalies();
-    selectedMachineId = MESH_DATA.machines[0].id;
-    Object.keys(localSearchState).forEach((machineId) => delete localSearchState[machineId]);
-    peerCommunicationState = null;
-    aiExplanationState = null;
-    machineCRetrievalState = { status: "idle", result: null, error: null };
-    syncQueueState = null;
-    gatewayState = null;
-    globalMemoryState = null;
-    lastGatewaySyncItems = [];
-    renderAll();
-    reportDemoAction("Resetting only isolated Machine B/C demo Edge memories, then checking Cloud status…", "");
+    reportDemoAction("Resetting Machine B and Machine C demo memories…", "");
     fetch("http://127.0.0.1:8000/api/demo/reset", { method: "POST" }).then(async (response) => {
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || "Isolated demo memory reset failed");
-      return body;
-    }).then((resetResult) => setCloudControl("ONLINE").then((result) => ({ resetResult, result }))).then(({ resetResult, result }) => {
-      reportDemoAction(`Demo reset complete. Isolated Edge memories cleared (B: ${resetResult.deleted_demo_memories["M-B-002"] || 0}, C: ${resetResult.deleted_demo_memories["M-C-003"] || 0}); Cloud is ${result.cloud_status.toUpperCase()}. Normal machine memories and queue history were preserved. ${result.message}`,
-        result.cloud_status === "online" ? "success" : "");
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Demo memory reset failed");
+
+      aiRequestControllers.forEach((controller) => controller.abort());
+      aiRequestControllers.clear();
+      aiRequests.clear();
+      demoGeneration += 1;
+      SensorSimulator.resetAll();
+      evaluateMachineAnomalies();
+      selectedMachineId = MESH_DATA.machines[0].id;
+      Object.keys(localSearchState).forEach((machineId) => delete localSearchState[machineId]);
+      Object.keys(localSearchRequests).forEach((machineId) => delete localSearchRequests[machineId]);
+      Object.keys(peerRequests).forEach((query) => delete peerRequests[query]);
+      Object.keys(verificationStates).forEach((fingerprint) => delete verificationStates[fingerprint]);
+      peerCommunicationState = null;
+      aiExplanationState = null;
+      machineCRetrievalState = { status: "idle", result: null, error: null };
       syncQueueState = null;
-      loadSyncQueue();
-      renderSync();
-      loadGateway(true);
-    }).catch((error) => reportDemoAction(`In-memory demo state reset, but isolated Edge reset/Cloud re-enable failed: ${error.message}.`, "error"));
+      gatewayState = null;
+      gatewayRequestSequence += 1;
+      globalMemoryState = null;
+      lastGatewaySyncItems = [];
+      gatewaySyncMessage = "";
+      renderAll();
+      loadCloudStatus();
+      loadServiceStatus();
+      reportDemoAction(
+        `Demo reset complete. Machine A seed retained; cleared ${result.deleted_demo_memories?.["M-B-002"] || 0} Machine B and ${result.deleted_demo_memories?.["M-C-003"] || 0} Machine C lifecycle record(s), plus ${result.removed_demo_queue_entries || 0} related queue row(s).`,
+        "success",
+      );
+    }).catch((error) => reportDemoAction(`Demo state reset failed: ${error.message}`, "error"));
   }
 }
 
@@ -1146,13 +1276,18 @@ document.addEventListener("DOMContentLoaded", () => {
   evaluateMachineAnomalies();
   renderAll();
   loadCloudStatus();
+  loadServiceStatus();
+  window.setInterval(() => {
+    loadCloudStatus();
+    loadServiceStatus();
+  }, 10000);
   SensorSimulator.start(() => {
     evaluateMachineAnomalies();
+    renderSensors();
     updateLocalSearch();
     renderLocalSearch();
     renderMachineList();
     renderMachineDetail();
-    renderSensors();
     renderPeers();
     renderAI();
   });

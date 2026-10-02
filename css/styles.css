@@ -116,6 +116,9 @@ button {
 .status-pill .value { color: var(--text); font-weight: 500; }
 .status-copy { display: grid; gap: 2px; }
 .status-note { color: var(--text-faint); font: 10px var(--font-ui); }
+.service-status { min-width: 140px; max-width: 220px; align-items: flex-start; }
+.service-status .status-copy { min-width: 0; }
+.service-status .status-note { overflow-wrap: anywhere; }
 .cloud-status-card { align-items: center; }
 .status-toggle {
   padding: 5px 8px;
@@ -273,6 +276,12 @@ button {
   gap: 14px;
 }
 
+.sensor-simulation-note {
+  margin: -6px 0 14px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
 .sensor-card {
   display: flex;
   min-width: 0;
@@ -317,6 +326,18 @@ button {
   font-family: var(--font-mono);
   line-height: 1.45;
 }
+
+.sensor-card .s-status {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.sensor-card .s-status.warning,
+.sensor-card .s-status.outside { color: var(--amber); }
+.sensor-card .s-status.critical { color: var(--red); }
 
 .sensor-card.warn { border-color: var(--amber-dim); }
 .sensor-card.warn .s-value { color: var(--amber); }

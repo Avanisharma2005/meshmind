@@ -68,8 +68,10 @@
           <button class="btn demo-reset" type="button" data-demo-action="reset">Reset Demo</button>
         </div>
         <div class="demo-control-groups">
-          <div class="demo-control-group"><h3>Selected machine · normal sensor state &amp; local Edge search</h3>
+          <div class="demo-control-group"><h3>Selected machine · sensor state</h3>
             <button class="btn btn-primary" type="button" data-demo-action="normal">Normal Machine</button>
+          </div>
+          <div class="demo-control-group"><h3>Selected machine · local Edge search</h3>
             <button class="btn" type="button" data-demo-action="search">Search Local Memory</button>
           </div>
           <div class="demo-control-group"><h3>Machine B · anomaly detection</h3>
@@ -171,6 +173,7 @@
       <!-- SENSOR MONITORING -->
       <section class="panel">
         <h2 class="panel-title">Sensor Monitoring</h2>
+        <p class="sensor-simulation-note">Simulated values update every 2 seconds. These are not measurements from physical sensors.</p>
         <div class="sensor-grid" id="sensor-grid">
           <!-- populated by js/app.js: renderSensors() -->
         </div>
@@ -249,7 +252,7 @@
   </main>
 
   <footer class="app-footer">
-    MeshMind prototype — frontend shell only. All data below is static/mock.
+    MeshMind local prototype: live sensor simulation, Edge memory, peer search, Gateway, and AI flows.
   </footer>
 
   <script src="js/data.js"></script>

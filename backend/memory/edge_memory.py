@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -123,7 +124,11 @@ class EdgeMemory:
                 {
                     "machine_id": machine_id,
                     "memory_backend": "Qdrant Edge",
-                    "memory_count": shard.count(CountRequest(exact=True)),
+                    "memory_count": (
+                        shard.count(CountRequest(exact=True))
+                        + self._demo_shards[machine_id].count(CountRequest(exact=True))
+                        if machine_id in self._demo_shards else shard.count(CountRequest(exact=True))
+                    ),
                 }
                 for machine_id, shard in self._shards.items()
             ]
@@ -201,27 +206,48 @@ class EdgeMemory:
         with self._lock:
             return shard.count(CountRequest(exact=True))
 
-    def reset_demo_memories(self) -> dict[str, int]:
-        """Clear only the isolated demo shards; normal machine memories are untouched."""
+    def reset_demo_memories(self) -> tuple[dict[str, int], set[str]]:
+        """Clear demo lifecycle records while preserving unrelated primary-shard data."""
         counts: dict[str, int] = {}
+        deleted_references: set[str] = set()
         with self._lock:
-            for machine_id, shard in self._demo_shards.items():
+            for machine_id in ("M-B-002", "M-C-003"):
                 deleted = 0
-                offset = None
-                while True:
-                    records, next_offset = shard.scroll(ScrollRequest(
-                        offset=offset, limit=256, with_payload=False, with_vector=False,
-                    ))
-                    if records:
-                        ids = [record.id for record in records]
-                        shard.update(UpdateOperation.delete_points(ids))
-                        deleted += len(ids)
-                    if next_offset is None:
-                        break
-                    offset = next_offset
-                shard.flush()
+                for shard, isolated_demo_shard in (
+                    (self._shards[machine_id], False),
+                    (self._demo_shards[machine_id], True),
+                ):
+                    offset = None
+                    point_ids: list[Any] = []
+                    while True:
+                        records, next_offset = shard.scroll(ScrollRequest(
+                            offset=offset, limit=256, with_payload=True, with_vector=False,
+                        ))
+                        for record in records:
+                            payload = record.payload if isinstance(record.payload, dict) else {}
+                            scope = str(payload.get("memory_scope") or "").strip().casefold()
+                            is_demo_lifecycle = scope == "demo"
+                            # Legacy Machine B demo validations predate persisted scope metadata.
+                            if (
+                                not isolated_demo_shard
+                                and machine_id == "M-B-002"
+                                and not scope
+                                and payload.get("validation_source") == "technician"
+                                and payload.get("technician_confirmed", payload.get("confirmed")) is True
+                            ):
+                                is_demo_lifecycle = True
+                            if isolated_demo_shard or is_demo_lifecycle:
+                                point_ids.append(record.id)
+                                deleted_references.add(str(record.id))
+                        if next_offset is None:
+                            break
+                        offset = next_offset
+                    if point_ids:
+                        shard.update(UpdateOperation.delete_points(point_ids))
+                        deleted = len(point_ids)
+                        shard.flush()
                 counts[machine_id] = deleted
-        return counts
+        return counts, deleted_references
 
     def import_cloud_knowledge(
         self, cloud_point_id: str, payload: dict[str, Any], vector: list[float], demo_mode: bool = False
@@ -276,6 +302,9 @@ class EdgeMemory:
         diagnosis: str,
         evidence: dict[str, Any],
         original_recommendation: str,
+        ai_recommendation: str = "",
+        ai_reasoning: str = "",
+        ai_confidence: int | None = None,
         corrected: bool = False,
         demo_mode: bool = False,
         incident_id: str | None = None,
@@ -301,14 +330,21 @@ class EdgeMemory:
             f"pressure {machine_b['current_pressure']} bar. "
             f"Anomaly query: {query}"
         )
-        stable_incident_id = (incident_id or f"{machine_id}:{query}").strip()
+        symptom_identity = ",".join(sorted(set(machine_b["triggered_sensors"]))) or "anomaly"
+        stable_incident_id = (incident_id or f"{machine_id}:{diagnosis.strip().casefold()}:{symptom_identity}").strip()
+        incident_fingerprint = str(uuid.uuid5(
+            uuid.NAMESPACE_URL, f"meshmind:{machine_id}:incident:{stable_incident_id}"
+        ))
         point_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"meshmind:{machine_id}:incident:{stable_incident_id}",
         ))
+        now = datetime.now(timezone.utc).isoformat()
         payload: dict[str, Any] = {
             "machine_id": machine_id,
+            "affected_machine_id": machine_id,
             "incident_id": stable_incident_id,
+            "incident_fingerprint": incident_fingerprint,
             "memory_scope": "demo" if demo_mode else "machine",
             "machine_type": machine_b["machine_type"],
             "incident_type": diagnosis.strip(),
@@ -324,34 +360,71 @@ class EdgeMemory:
             "confirmed": True,
             "validation_source": "technician",
             "ai_recommendation": original_recommendation,
+            "ai_action_recommendation": ai_recommendation,
+            "ai_reasoning": ai_reasoning,
+            "ai_confidence": ai_confidence,
             "ai_recommendation_rejected": corrected,
+            "updated_at": now,
         }
         with self._lock:
             shard_b = self._demo_shards[machine_id] if demo_mode else self._shards[machine_id]
             existing = shard_b.retrieve(
                 point_ids=[point_id], with_payload=True, with_vector=False
             )
-            if not existing:
-                shard_b.update(
-                    UpdateOperation.upsert_points(
-                        [Point(
-                            id=point_id,
-                            vector={VECTOR_NAME: self._embed(incident_text)},
-                            payload=payload,
-                        )]
-                    )
+            old_payload = existing[0].payload if existing else {}
+            payload["created_at"] = old_payload.get("created_at", now)
+            payload["observation_count"] = int(old_payload.get("observation_count", 0)) + 1
+            payload["source_machine_id"] = (
+                (evidence.get("machine_a_peer_knowledge") or {}).get("source_machine_id")
+                or old_payload.get("source_machine_id")
+            )
+            payload["sensor_evidence"] = machine_b
+            payload["peer_evidence"] = (
+                evidence.get("machine_a_peer_knowledge") or old_payload.get("peer_evidence")
+            )
+            payload["local_search_evidence"] = (
+                evidence.get("machine_b_local_search") or old_payload.get("local_search_evidence")
+            )
+            payload["validation_evidence"] = evidence
+            validation_history = old_payload.get("validation_history", [])
+            if not isinstance(validation_history, list):
+                validation_history = []
+            payload["validation_history"] = [
+                *validation_history,
+                {
+                    "decision": "corrected" if corrected else "confirmed",
+                    "diagnosis": diagnosis.strip(),
+                    "original_recommendation": original_recommendation,
+                    "ai_action_recommendation": ai_recommendation,
+                    "ai_reasoning": ai_reasoning,
+                    "ai_confidence": ai_confidence,
+                    "recorded_at": now,
+                },
+            ]
+            shard_b.update(
+                UpdateOperation.upsert_points(
+                    [Point(
+                        id=point_id,
+                        vector={VECTOR_NAME: self._embed(incident_text)},
+                        payload=payload,
+                    )]
                 )
-                shard_b.flush()
-            stored_payload = existing[0].payload if existing else payload
+            )
+            shard_b.flush()
             return {
                 "machine_id": machine_id,
-                "incident_type": stored_payload.get("incident_type", diagnosis.strip()),
+                "incident_type": payload["incident_type"],
                 "incident_id": stable_incident_id,
+                "incident_fingerprint": incident_fingerprint,
+                "created_at": payload["created_at"],
+                "updated_at": payload["updated_at"],
                 "local_memory_reference_id": point_id,
                 "memory_created": not bool(existing),
                 "technician_confirmed": True,
                 "memory_count": shard_b.count(CountRequest(exact=True)),
                 "memory_scope": "demo" if demo_mode else "machine",
+                "observation_count": payload["observation_count"],
+                "validation_history_count": len(payload["validation_history"]),
             }
 
     def close(self) -> None:
