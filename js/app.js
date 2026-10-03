@@ -208,13 +208,14 @@ function renderHeaderStatus() {
         <span class="status-note">${escapeHTML(message || "Checking backend service…")}</span></span>
     </div>`;
   const aiStatus = ai.selected ? ai.status : "unavailable";
+  const cloudStateClass = cloudSyncFailed ? "error" : cloudStatusSetting.toLowerCase().replace(/[^a-z0-9]+/g, "-");
   const inferenceStatus = aiExplanationState?.status === "running" ? "INFERENCE RUNNING"
     : aiExplanationState?.status === "complete" ? "INFERENCE SUCCESSFUL"
       : aiExplanationState?.status === "error" ? "INFERENCE FAILED" : null;
   const aiValue = inferenceStatus || (aiStatus === "connected" ? `OLLAMA AVAILABLE · ${ai.model || "Ollama"}`
     : aiStatus === "configured" ? `CONFIGURED · ${ai.model || "Gemini"}` : statusValue(aiStatus));
   el.innerHTML = `
-      <div class="status-pill cloud-status-card" aria-live="polite">
+      <div class="status-pill cloud-status-card" data-cloud-state="${escapeHTML(cloudStateClass)}" aria-live="polite">
       <span class="dot ${cloudStatusSetting === "CHECKING" || cloudStatusSetting === "CONFIGURED BUT UNREACHABLE" ? "amber" : cloudOffline ? "red" : "green"}"></span>
       <div class="status-copy">
         <div><span class="label">QDRANT CLOUD</span> <span class="value">${cloudSyncFailed ? "SYNCHRONIZATION FAILED" : cloudStatusSetting}</span></div>
@@ -632,7 +633,17 @@ function renderAI() {
       const progress = provider === "ollama"
         ? `Local AI · Ollama${model}`
         : `AI${provider ? ` · ${provider}` : ""}${model}`;
-      el.innerHTML = `<div class="badge cyan">${escapeHTML(progress)}</div><div class="memory-unavailable">Analyzing machine and peer evidence...</div>`;
+      el.innerHTML = `
+        <div class="ai-loading" role="status" aria-live="polite">
+          <div class="badge cyan">${escapeHTML(progress)}</div>
+          <p class="ai-loading-title">Analyzing machine and peer evidence...</p>
+          <ol class="ai-loading-flow" aria-label="AI analysis stages">
+            <li class="is-active"><span>01</span><strong>Machine B</strong><small>Current anomaly</small></li>
+            <li><span>02</span><strong>Peer evidence</strong><small>Retrieved knowledge</small></li>
+            <li><span>03</span><strong>${escapeHTML(ai.model || "AI model")}</strong><small>Evidence analysis</small></li>
+            <li><span>04</span><strong>Recommendation</strong><small>Awaiting response</small></li>
+          </ol>
+        </div>`;
       return;
     }
     el.innerHTML = `<div class="memory-unavailable">${escapeHTML(state.error || state.status)}</div>`;
@@ -740,7 +751,7 @@ function explainCurrentEvidence(query, localResult, peerKnowledge) {
   console.info(`[MeshMind] AI request start provider=${aiServiceState?.provider || "configured"}`);
   const controller = new AbortController();
   aiRequestControllers.set(fingerprint, controller);
-  const timeout = setTimeout(() => controller.abort(), 135000);
+  const timeout = setTimeout(() => controller.abort(), 195000);
   const request = fetch("http://127.0.0.1:8000/api/ai/explain", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -776,7 +787,7 @@ function renderVerification() {
   const machine = getSelectedMachine();
   const state = machine.id === "M-B-002" ? aiExplanationState : null;
   if (!state || state.status !== "complete" || !state.result) {
-    el.textContent = "No AI recommendation available for technician verification yet.";
+    el.innerHTML = `<div class="verification-empty"><span class="verification-step">TECHNICIAN REVIEW</span><p>${state?.status === "running" ? "Review will be available when the AI analysis finishes." : "No AI recommendation available for technician verification yet."}</p></div>`;
     return;
   }
   const saved = verificationStates[state.fingerprint];

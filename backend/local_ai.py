@@ -41,11 +41,10 @@ def ollama_config() -> tuple[str, str, float]:
     model = os.environ.get("OLLAMA_MODEL", "gemma3:4b").strip()
     try:
         # A cold gemma3:4b inference is known to take about 53 seconds locally.
-        # Keep a bounded 120-second minimum while allowing operators to choose a
-        # longer timeout up to three minutes for slower hardware.
-        timeout = max(120.0, min(float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120")), 180.0))
+        # Keep a bounded timeout for slower local hardware, up to three minutes.
+        timeout = max(120.0, min(float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "180")), 180.0))
     except ValueError:
-        timeout = 120.0
+        timeout = 180.0
     if not base_url or not model:
         raise LocalAIError("OLLAMA_BASE_URL and OLLAMA_MODEL must be configured.")
     return base_url, model, timeout
